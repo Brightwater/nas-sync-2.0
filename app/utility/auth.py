@@ -43,11 +43,21 @@ async def verifyJwt(token: str):
         raise credentials_exception
     return True
 
-async def verifyJwtOrLocal(token: str, request: Request):
+async def verifyJwtOrLocal(token: None, request: Request):
     if request.client[0][0:9] == "192.168.1" or request.client[0][0:9] == "127.0.0.1":
         return True
     else:
         return await verifyJwt(token)    
+    
+async def verifyRemote(name: str, token: str, request: Request):
+    remotes = await database.fetch_one(f"select address, token from hosted_remotes where nickname = '{name}' and token = '{token}'")
+    if not remotes:
+        return False
+    # return True
+    if request.client[0][0:9] == "192.168.1" or request.client[0][0:9] == "127.0.0.1" or request.client[0] == remotes['address']:
+        return True
+    else:
+        return False
 
 def getPasswordHash(password):
     return pwd_context.hash(password)

@@ -1,5 +1,6 @@
 #!/bin/bash
 cd app
+
 uvicorn main:app --reload --port 4304 --host 0.0.0.0 &
 pid1=$!
 echo "started proc1: ${pid1}"

@@ -40,8 +40,10 @@ def processTask(task):
             addSyncPathTask(task, TEMP_PATH, conn)
             
         elif name == 'Sync':
-            syncFilesToRemote(conn)
+            syncFilesToRemote(conn, task)
             
+        elif name == 'Retrive file from remote':
+            downloadFileFromRemote(conn, task)
         else:
             # probably shouldn't be a real thing
             log("Unsupported task type, erroring it out")
@@ -55,7 +57,7 @@ def processTask(task):
 def readTaskQueue():
     cur = conn.cursor()
     try:
-        cur.execute("select * from taskqueue where try < 4 and status <> 'Scheduled' and status <> 'Complete' order by ts desc")
+        cur.execute("select * from taskqueue where try < 4 and status <> 'Scheduled' and status <> 'Complete' order by ts asc")
         task = cur.fetchone()
         if task:
             tryNum = int(task['try']) + 1
@@ -69,11 +71,11 @@ def readTaskQueue():
         
 if __name__ == "__main__":
     conn = psycopg.connect(user = "postgres",
-                                    password = "",
-                                    host = "127.0.0.1",
-                                    port = "5432",
-                                    dbname = "nassync",
-                                    row_factory=dict_row )
+                                password = "",
+                                host = "127.0.0.1",
+                                port = "5432",
+                                dbname = "nassync",
+                                row_factory=dict_row )
     cur = conn.cursor()
     
     # get needed properties
@@ -88,29 +90,18 @@ if __name__ == "__main__":
     log("Starting task loop")
     
     signal.signal(signal.SIGINT, handler) # catch sigint to close db conn first
+    time.sleep(5)
     
     while True:
         try:
-            # first check if its time for a scheduled task
-            # TODO THAT ^
-            
             # read task from task queue
             task = readTaskQueue()
             if task:
                 log("Processing task: " + task['name'])
                 processTask(task)
-            #else:
-            time.sleep(60) # move to else later
+            else:
+                time.sleep(120) # move to else later
         except Exception as e:
             print(e)
-            time.sleep(60) # sleep 30s to check before checking for tasks again
+            time.sleep(120) # sleep 30s to check before checking for tasks again
 
-    
-
-    
-# # @app.task(cron("* * * * *"))
-# # async def fetchTasks():
-# #     dUser = await database.fetch_all(f"select username from authenticated_user")
-# #     await run_in_threadpool(lambda: print(dUser[0]))
-    
-# # task to check for failed tasks?

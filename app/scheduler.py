@@ -30,10 +30,6 @@ def scheduleTasks():
     # should run at start of sync interval
     if int(currentHour) == 1 and int(currentMin) == 15:
         insertScheduleTask("Sync")
-        
-    # run at end of sync interval ish
-    #if currentHour == 10 and currentMin == 0:
-    #    syncRanToday = False
 
 def handler(signum, frame):
     msg = "Scheduler: Ctrl-c was pressed. "
