@@ -94,15 +94,27 @@ async def getSyncFileFromFakeName(name, fakeName):
                         ) as s on s.nickname = r.nickname
                         where r.nickname = '{name}'
                         and s.try < 4""")
-    # return remoteWithSyncs
-    filePath = None
+    properties = await database.fetch_all(f"""select *
+                        from properties p""")
+    try:
+        p = json.loads(properties[0]['props'])
+        if (p['tempPath'] == None):
+            raise Exception()
+        filePath = p['tempPath'] + "/" +fakeName
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=e,
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    found = None
     for sync in remoteWithSyncs:
         # need to find the one that has the right file
         for file in json.loads(sync['individualfileswithpaths']):
             if file['nameFake'] == fakeName:
-                filePath = file['fullPath']
+                found = "f"
                 break
-        if filePath:
+        if found:
             break
         # see if it was the metadata file..
         #metadata.bOPaYCcTrfqtRGn.enc
@@ -116,9 +128,11 @@ async def getSyncFileFromFakeName(name, fakeName):
         # log(f"{task['task']['nameFake']} not found or a thing went wrong...")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Incorrect username or password",
+            detail="file path not found",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    await run_in_threadpool(lambda: print("the path found: " + filePath))
+  
     return filePath
         
 async def runIntervalCheck():
@@ -152,7 +166,7 @@ async def newSyncPath(filePath: str, token: Token, remoteName: str, request: Req
             detail=f"Invalid remote name {remoteName}",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    amountRemaining = int(r['space']) + 10 # 10mb buffer
+    amountRemaining = int(r['space']) - 10 # 10mb buffer
     # return {"a": sizeNeeded, "b": amountRemaining}
     # return amountRemaining >= sizeNeeded
     if amountRemaining <= sizeNeeded:
@@ -171,11 +185,17 @@ async def newSyncPath(filePath: str, token: Token, remoteName: str, request: Req
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Invalid file or directory"
         )
+        
+    if tree['contents'] == None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Must be a directory not a file"
+        )
     
     addHashesToTree(tree, tree['name'], True)
-    tree['remote'] = 'test'
+    tree['remote'] = remoteName
     tree['syncSize'] = sizeNeeded
-    await database.execute(f"insert into taskqueue (name, task, ts, status, try) values('Add sync path', '{json.dumps(tree)}', NOW(), 'Queued', 0)")
+    await database.execute(f"insert into taskqueue (name, task, ts, status, try, retry_ts) values('Add sync path', '{json.dumps(tree)}', NOW(), 'Queued', 0, NOW())")
         
     return tree
 
@@ -262,8 +282,9 @@ async def syncFromRemote(name: str, token: str, sync: SyncData, request: Request
         taskObj['port'] = f['port']
         taskObj['index'] = i
         taskObj['numInSync'] = len(sync.individualFilesWithHashes) - 1
+        taskObj['syncName'] = sync.name
 
-        await database.execute(f"insert into taskqueue (name, task, ts, status, try) values('Retrive file from remote', '{json.dumps(taskObj)}', NOW(), 'Queued', 5)")
+        await database.execute(f"insert into taskqueue (name, task, ts, status, try, retry_ts) values('Retrive file from remote', '{json.dumps(taskObj)}', NOW(), 'Queued', 0, NOW())")
 
     return json.dumps(sync.individualFilesWithHashes)
 
@@ -302,6 +323,58 @@ async def checkFileSize(name: str, token: str, fakeName: str, request: Request):
         )
     filePath = await getSyncFileFromFakeName(name, fakeName)
     return await run_in_threadpool(lambda: os.path.getsize(filePath) * 0.000001)
+
+@router.get("/notifySyncComplete")
+async def notifySyncComplete(name: str, token: str, syncName: str, request: Request):
+    if not await verifyRemote(name, token, request):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    # need to complete the original sync task & insert into sync table & delete temp files
+    task = await database.fetch_all(f"""
+                                    select s.syncpath, s.syncfakename, s.syncsize, s.task
+                                    from (
+                                        select task::json ->> 'syncFakeName' as syncFakeName,
+                                        task::json ->> 'syncSize' as syncSize,
+                                        task::json ->> 'name' as syncPath,
+                                        task::json ->> 'metadataFilePath' as metadatafilepath,
+                                        task::json ->> 'metadataFileName' as metadatafilename,
+                                        t2.* 
+                                        from taskqueue t2
+                                        where t2.name = 'Add sync path'
+                                        and t2.status <> 'Complete'
+                                    ) as s 
+                                    where s.syncFakeName = '{syncName}'""")
+    
+    await database.execute(f"""update taskqueue t
+                                set status = 'Cleaning up'
+                                where id in (
+                                    select s.id
+                                    from (
+                                        select task::json ->> 'syncFakeName' as syncFakeName,
+                                        task::json ->> 'individualFilesWithPaths' as individualFilesWithPaths,
+                                        task::json ->> 'metadataFilePath' as metadatafilepath,
+                                        task::json ->> 'metadataFileName' as metadatafilename,
+                                        t2.* 
+                                        from taskqueue t2
+                                        where t2.name = 'Add sync path'
+                                        and t2.status <> 'Scheduled'
+                                    ) as s 
+                                    where s.syncFakeName = '{syncName}'
+                                )""")
+    
+    await database.execute(f"""update my_remotes
+                                set used_space_in_mb = used_space_in_mb + '{task['syncsize']}', 
+                                remaining_space_in_mb = remaining_space_in_mb - '{task['syncsize']}' 
+                                where nickname = '{name}'""")
+    task = task[0]
+    await database.execute(f"""insert into my_syncs
+                            (name, size, metadata, status, real_path)
+                            values('{syncName}', {task['syncsize']}, '{task['task']}', 'Synced', '{task['syncpath']}')""")
+
+    return task
     
 @router.get("/downloadForSync")
 async def hostFileDownloadForSync(name: str, token: str, fakeName: str, request: Request):

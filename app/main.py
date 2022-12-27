@@ -56,13 +56,13 @@ async def add_process_time_header(request: Request, call_next):
 async def files():
     return FileResponse(path="/home/jeremiah", filename="jere", media_type='application/octet-stream')
 
-@app.get("/rootsDownload")
+@app.get("/downloadTest")
 async def fileDol():
     async def iterfile():
-       async with aiofiles.open("/media/drives/Media-2/Torrent/roots.zip", 'rb') as f:
+       async with aiofiles.open("/media/drives/Media-1/nassyncTemp/bVQGGLbGYugaovp.enc", 'rb') as f:
             while chunk := await f.read(CHUNK_SIZE):
                 yield chunk
 
-    headers = {'Content-Disposition': 'attachment; filename="roots.zip"'}
+    headers = {'Content-Disposition': 'attachment; filename="outtest.enc"'}
     return StreamingResponse(iterfile(), headers=headers, media_type='application/octet-stream')
 

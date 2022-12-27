@@ -54,7 +54,7 @@ async def verifyRemote(name: str, token: str, request: Request):
     if not remotes:
         return False
     # return True
-    if request.client[0][0:9] == "192.168.1" or request.client[0][0:9] == "127.0.0.1" or request.client[0] == remotes['address']:
+    if request.client[0][0:8] == "192.168." or request.client[0][0:9] == "127.0.0.1" or request.client[0] == remotes['address']:
         return True
     else:
         return False

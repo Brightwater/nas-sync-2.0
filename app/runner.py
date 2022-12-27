@@ -6,17 +6,22 @@ import signal
 from datetime import datetime
 from utility.task import *
 from scheduler import log
+import traceback
 
 # # https://crontab.guru/#45_17_*_*_*
 
 TEMP_WITH_ORIGINAL = True
 TEMP_PATH = None
 conn = None
+cur = None
 
 
 def handler(signum, frame):
     msg = "Scheduler: Ctrl-c was pressed. "
     print(msg, end="", flush=True)
+    if cur:
+        conn.rollback()
+        cur.close()
     conn.close()    
     exit(1)
     
@@ -24,10 +29,12 @@ def errorOutTask(task):
     cur = conn.cursor()
     log("Erroring out task " + str(task))
     try:
-        cur.execute(f"update taskqueue set status = 'Failed' where id = {task['id']}")
+        cur.execute(f"update taskqueue set retry_ts = NOW() + 120 * interval '1 second' where id = {task['id']}")
         conn.commit()
     except Exception as e:
         print(e)
+        if cur:
+            cur.close()
     cur.close()
     
 # process the task
@@ -36,14 +43,21 @@ def processTask(task):
     try:
         name = task['name']
         # determine task type
-        if name == 'Add sync path':
+        if name == 'Add sync path' and task['status'] != 'Cleaning up':
             addSyncPathTask(task, TEMP_PATH, conn)
-            
+        
+        elif name == 'Add sync path' and task['status'] == 'Cleaning up':
+            cleanupNewSync(task, TEMP_PATH, conn)
+          
         elif name == 'Sync':
-            syncFilesToRemote(conn, task)
+            syncFilesToRemote(conn, task, TEMP_PATH)
             
         elif name == 'Retrive file from remote':
             downloadFileFromRemote(conn, task)
+            
+        elif name == 'Sync update':
+            syncUpdate(conn, task)    
+            
         else:
             # probably shouldn't be a real thing
             log("Unsupported task type, erroring it out")
@@ -51,22 +65,34 @@ def processTask(task):
             return
         log("Finished task " + name)
     except Exception as e:
-        log(e)
+        log(traceback.format_exc())
         errorOutTask(task)
 
 def readTaskQueue():
     cur = conn.cursor()
     try:
-        cur.execute("select * from taskqueue where try < 4 and status <> 'Scheduled' and status <> 'Complete' order by ts asc")
+        cur.execute("""select * 
+                    from taskqueue 
+                    where try < 4 
+                    and status <> 'Scheduled' 
+                    and status <> 'Complete' 
+                    and status <> 'Syncing'
+                    and NOW() >= retry_ts
+                    order by ts asc""")
         task = cur.fetchone()
+        cur.close()
+        
         if task:
+            cur = conn.cursor()
             tryNum = int(task['try']) + 1
             cur.execute(f"update taskqueue set try = {tryNum} where id = {task['id']}")
             conn.commit()
+            cur.close()
     except Exception as e:
         log(e)
         task = None
-    cur.close()
+        if cur:
+            cur.close()
     return task
         
 if __name__ == "__main__":
@@ -95,13 +121,14 @@ if __name__ == "__main__":
     while True:
         try:
             # read task from task queue
+            print("TASK LOOP")
             task = readTaskQueue()
             if task:
-                log("Processing task: " + task['name'])
+                log("Processing task: " + task['name'] + " task status: " + task['status'])
                 processTask(task)
             else:
-                time.sleep(120) # move to else later
+                time.sleep(15) # move to else later
         except Exception as e:
             print(e)
-            time.sleep(120) # sleep 30s to check before checking for tasks again
+            time.sleep(15) # sleep 30s to check before checking for tasks again
 

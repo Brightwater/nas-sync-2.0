@@ -11,15 +11,25 @@ conn = None
 def log(msg):
     print("Scheduler - " + str(datetime.now()) + ": " + str(msg))
     
-def insertScheduleTask(task):
+def insertScheduleTask(task, nickname):
     cur = conn.cursor()
-    log("Triggering task " + str(task))
+    log("Triggering task " + str(task) + " " + nickname)
     try:
-        cur.execute(f"insert into taskqueue (name, task, ts, status, try) values('{task}', null, NOW(), 'Queued', 0)")
+        d = {}
+        d['nickname'] = nickname
+        cur.execute(f"insert into taskqueue (name, task, ts, status, try, retry_ts) values('{task}', '{json.dumps(d)}', NOW(), 'Queued', 0, NOW())")
         conn.commit()
     except Exception as e:
-        print(e)
+        log(e)
     cur.close()
+    
+def scheduleSyncsAllRemotes():
+    cur = conn.cursor()
+    cur.execute(f"select * from my_remotes")
+    remotes = cur.fetchall()
+    cur.close()
+    for r in remotes:
+        insertScheduleTask("Sync", r['nickname'])
 
 # runs tasks at their scheduled time
 def scheduleTasks():
@@ -28,8 +38,8 @@ def scheduleTasks():
     
     # master sync task
     # should run at start of sync interval
-    if int(currentHour) == 1 and int(currentMin) == 15:
-        insertScheduleTask("Sync")
+    if int(currentHour) == 16 and int(currentMin) == 15:
+        scheduleSyncsAllRemotes()
 
 def handler(signum, frame):
     msg = "Scheduler: Ctrl-c was pressed. "
@@ -50,7 +60,6 @@ if __name__ == "__main__":
     # cur.execute("select props from properties")
     # props = cur.fetchone()['props']
     # cur.close()
-   
     
     log("Starting scheduler loop")
     
