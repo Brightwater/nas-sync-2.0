@@ -74,24 +74,40 @@ def processTask(task):
 def readTaskQueue():
     cur = conn.cursor()
     try:
+        # cur.execute("""select * 
+        #             from taskqueue 
+        #             where try < 4 
+        #             and status <> 'Scheduled' 
+        #             and status <> 'Complete' 
+        #             and status <> 'Syncing'
+        #             and NOW() >= retry_ts
+        #             order by ts asc
+        #             limit 1""")
+        # task = cur.fetchone()
+        
         cur.execute("""select * 
                     from taskqueue 
                     where try < 4 
                     and status <> 'Scheduled' 
                     and status <> 'Complete' 
                     and status <> 'Syncing'
-                    and NOW() >= retry_ts
-                    order by ts asc
-                    limit 1""")
-        task = cur.fetchone()
+                    order by ts asc""")
+        task = None
+        tasks = cur.fetchall()
         cur.close()
-        print(task)
+        for t in tasks:
+            if datetime.now() > t['retry_ts']:
+                task = t
+                break
+        
         if task:
             cur = conn.cursor()
             tryNum = int(task['try']) + 1
             cur.execute(f"update taskqueue set try = {tryNum} where id = {task['id']}")
             conn.commit()
             cur.close()
+        elif len(tasks) > 0:
+            print(f"Next retry task will be at: {tasks[0]['retry_ts']}")
     except Exception as e:
         log(e)
         task = None
@@ -125,7 +141,7 @@ if __name__ == "__main__":
     while True:
         try:
             # read task from task queue
-            print("TASK LOOP")
+            # print("TASK LOOP")
             task = readTaskQueue()
             if task:
                 log("Processing task: " + task['name'] + " task status: " + task['status'])

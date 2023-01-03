@@ -6,15 +6,16 @@ import string
 import aiofiles
 from fastapi import APIRouter, Depends, Header, HTTPException, status, Request
 from fastapi.responses import FileResponse, StreamingResponse
+from numpy import floor
 from utility.auth import verifyJwt, verifyJwtOrLocal, verifyRemote
 from utility.database import database
 from fastapi.concurrency import run_in_threadpool
 import subprocess
 import json
 from model.pydantics import SyncUpdateData, Token, SyncData
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 
-CHUNK_SIZE = 1024 * 1024
+CHUNK_SIZE = 1024 * 1024 # 1MB
 
 KNOWN_TYPES = ["jpg", "jpeg", "png", "txt", "mp4", "mp3", "csv", "m4a", "mkv", "sh", "py"]
 
@@ -29,7 +30,6 @@ router = APIRouter(
 # tree -J /home/jeremiah/development/nas-share2.0
 
 
-
 def openSslEncryptFile(token, inputFilePath, outPutFilePath):
     #cmd = f"openssl enc -aes-256-cbc -pbkdf2 -in {inputFilePath} -out {outPutFilePath} -pass pass:{token}".split(" ")
     cmd = ["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-in", inputFilePath, "-out", outPutFilePath, "-pass", f"pass:{token.replace('$', '')}"]
@@ -40,13 +40,13 @@ def openSslDecryptFile(token, inputFilePath, outPutFilePath):
     subprocess.run(cmd, capture_output=True, text=True)
     
 def getDirSize(inputFilePath):
-    '''outputs in megabytes'''
-    #cmd = du -sh /path/to/dir
+    '''outputs in kilobytes'''
     cmd = ["du", "-sm", f'{inputFilePath}']
-    return subprocess.run(cmd, capture_output=True, text=True).stdout.split('\t')[0]
+    return int(subprocess.run(cmd, capture_output=True, text=True).stdout.split('\t')[0]) * 1000 # convert to KB
     
+@router.get("/thetest")
 def computeMd5FileHash(inputFilePath):
-    return subprocess.check_output(args=f'md5sum {inputFilePath}', shell=True).decode().split(' ')[0].strip()
+    return subprocess.check_output(args=['md5sum', inputFilePath]).decode().split(' ')[0].strip()
 
 def getDirTreeDict(inputDirPath):
     tree = json.loads(subprocess.check_output(args=['tree', '-J', f'{inputDirPath}', '-L', '10']).decode())[0]
@@ -78,7 +78,7 @@ def addHashesToTree(tree, basePath, new: bool):
             if item['type'] == "directory" and item['contents'] != None:
                 addHashesToTree(item, basePath+"/"+item['name'], new) 
             else:
-                item['hash'] = computeMd5FileHash('"'+basePath+"/"+item['name']+'"')
+                item['hash'] = computeMd5FileHash(basePath+"/"+item['name'])
                 item['type']= detFileType(item['name'])
     except Exception:
         print(f"Exception building tree: {tree} probably too deep")
@@ -123,7 +123,7 @@ async def getSyncFileFromFakeName(name, fakeName):
         # see if it was the metadata file..
         #metadata.bOPaYCcTrfqtRGn.enc
         #
-        await run_in_threadpool(lambda: print(sync['metadatafilename'] + fakeName))
+        # await run_in_threadpool(lambda: print(sync['metadatafilename'] + fakeName))
         if sync['metadatafilename'] == fakeName:
             filePath = sync['metadatafilepath']
             break
@@ -141,13 +141,28 @@ async def getSyncFileFromFakeName(name, fakeName):
         
 async def runIntervalCheck():
     props = await database.fetch_one(f"select props from properties")
-    props = props['props']
-    props = json.loads(props)
+    props = json.loads(props['props'])
+    
     syncIntervalStart = time(props['syncIntervalStart']['hour'], props['syncIntervalStart']['minute'])
     syncIntervalStop = time(props['syncIntervalStop']['hour'], props['syncIntervalStop']['minute'])
-    if syncIntervalStart < datetime.now().time() < syncIntervalStop:
-        return True
-    return False
+    now = datetime.now()
+    if syncIntervalStart < now.time() < syncIntervalStop:
+        return True # able to sync now
+    
+    # not able to sync yet so tell how many minutes until sync is open
+    # hacky doing it this way because we have to say interval can only start in the same day as it ends
+    
+    # spaghetti
+    dt = now
+    if now.hour <= 23 and now.hour > props['syncIntervalStart']['hour']:
+        dt = now + timedelta(days=1)
+    else:
+        dt = now
+    dt = datetime(dt.year, dt.month, dt.day, props['syncIntervalStart']['hour'], (props['syncIntervalStart']['minute'] + 1), 0 , 0)
+    
+    timeDiff = dt - now
+    
+    return floor(timeDiff.total_seconds() / 60)
         
 @router.post("/addNewSync")
 async def newSyncPath(filePath: str, token: Token, remoteName: str, request: Request):
@@ -161,9 +176,9 @@ async def newSyncPath(filePath: str, token: Token, remoteName: str, request: Req
         
     # check dir size with du -sh /path/to/dir
     # units in mb
-    sizeNeeded = int(await run_in_threadpool(lambda: getDirSize(filePath)))
+    sizeNeeded = await run_in_threadpool(lambda: getDirSize(filePath))
 
-    r = await database.fetch_one(f"select remaining_space_in_mb as space from my_remotes where nickname = '{remoteName}'")
+    r = await database.fetch_one(f"select remaining_space_in_kb as space from my_remotes where nickname = '{remoteName}'")
     if not r:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -213,7 +228,14 @@ async def checkInterval(name: str, token: str, request: Request):
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )   
-    return await runIntervalCheck()   
+    i = await runIntervalCheck()
+    if i != True:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=i,
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return i
 
 @router.get("/testd")
 async def t():
@@ -227,20 +249,20 @@ async def syncFromRemote(name: str, token: str, sync: SyncData, request: Request
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
-    if not await runIntervalCheck():
+    i = await runIntervalCheck()
+    if i != True:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not allowed to sync at this time",
+            detail=i,
             headers={"WWW-Authenticate": "Bearer"},
         )
         
     # verify they have enough space based on what they claim... 
     # (actual validation will have to be done using each file)
-    # units in mb
+    # units in KB
     sizeNeeded = sync.syncSize
 
-    r = await database.fetch_one(f"select remaining_space_in_mb as space from hosted_remotes where nickname = '{name}'")
+    r = await database.fetch_one(f"select remaining_space_in_kb as space from hosted_remotes where nickname = '{name}'")
     if not r:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -301,10 +323,11 @@ async def syncUpdateFromRemote(name: str, token: str, sync: SyncUpdateData, requ
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    if not await runIntervalCheck():
+    i = await runIntervalCheck()
+    if i != True:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not allowed to sync at this time",
+            detail=i,
             headers={"WWW-Authenticate": "Bearer"},
         )
     
@@ -333,7 +356,7 @@ async def syncUpdateFromRemote(name: str, token: str, sync: SyncUpdateData, requ
     # syncSizeObj['address'] = f['address']
     # syncSizeObj['port'] = f['port']
     # syncSizeObj['syncName'] = sync.name
-    # syncSizeObj['usedSpace'] = f['used_space_in_mb']
+    # syncSizeObj['usedSpace'] = f['used_space_in_kb']
     # await database.execute(f"insert into taskqueue (name, task, ts, status, try, retry_ts) values('Determine pending deletes size', '{json.dumps(syncSizeObj)}', NOW(), 'Queued', 0, NOW())")
 
     # create tasks for all the files for the taskrunner to process
@@ -393,7 +416,7 @@ async def checkFileSize(name: str, token: str, fakeName: str, request: Request):
             headers={"WWW-Authenticate": "Bearer"},
         )
     filePath = await getSyncFileFromFakeName(name, fakeName)
-    return await run_in_threadpool(lambda: os.path.getsize(filePath) * 0.000001)
+    return await run_in_threadpool(lambda: os.path.getsize(filePath) * 0.001)
 
 @router.get("/notifySyncComplete")
 async def notifySyncComplete(name: str, token: str, syncName: str, isUpdate: bool, usedSpace: int, request: Request):
@@ -423,8 +446,8 @@ async def notifySyncComplete(name: str, token: str, syncName: str, isUpdate: boo
                                 )""")
     
     await database.execute(f"""update my_remotes
-                                set used_space_in_mb = used_space_in_mb + '{usedSpace}', 
-                                remaining_space_in_mb = remaining_space_in_mb - '{usedSpace}' 
+                                set used_space_in_kb = used_space_in_kb + '{usedSpace}', 
+                                remaining_space_in_kb = remaining_space_in_kb - '{usedSpace}' 
                                 where nickname = '{name}'""")
     
     if isUpdate:
@@ -477,12 +500,12 @@ async def hostFileDownloadForSync(name: str, token: str, fakeName: str, request:
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    if not await runIntervalCheck():
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not allowed to sync at this time",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+    # if not await runIntervalCheck():
+    #     raise HTTPException(
+    #         status_code=status.HTTP_403_FORBIDDEN,
+    #         detail="Not allowed to sync at this time",
+    #         headers={"WWW-Authenticate": "Bearer"},
+    #     )
     
     filePath = await getSyncFileFromFakeName(name, fakeName)    
     
@@ -493,3 +516,12 @@ async def hostFileDownloadForSync(name: str, token: str, fakeName: str, request:
 
     headers = {'Content-Disposition': f'attachment; filename="{fakeName}"'}
     return StreamingResponse(iterfile(), headers=headers, media_type='application/octet-stream')
+
+@router.get("deleteSyncFileBlock")
+async def deleteFileBlock(name: str, token: str, request: Request):
+    if not await verifyRemote(name, token, request):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect username or password",
+                headers={"WWW-Authenticate": "Bearer"},
+            )

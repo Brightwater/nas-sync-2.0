@@ -169,7 +169,15 @@ def syncFilesToRemote(conn, task, tempPlace):
         params = {'name': sync['nickname'], 'token': sync['token']}
         try:
             req = requests.post(f'{addr}/file/syncFromRemote', params=params, json=sendObj)
-            if req.status_code != 200:
+            if req.status_code == 403:
+                # remote is not up currently... delay task until its up
+                with conn.cursor() as cur:
+                    minutesUntil = int(json.loads(req.text)['detail'])
+                    log(f"sleeping task until remote is ready in {minutesUntil} minutes" + str(task))
+                    cur.execute(f"update taskqueue set retry_ts = NOW() + {minutesUntil} * interval '1 minute' where id = {task['id']}")
+                    conn.commit()
+                return
+            elif req.status_code != 200:
                 raise Exception
         except:
             log(f"Remote {sync['nickname']} not up or not accepting syncs currently. Will try again later.")
@@ -179,7 +187,6 @@ def syncFilesToRemote(conn, task, tempPlace):
         cur.execute(f"update taskqueue set status = 'Syncing' where id = {sync['id']}")
         conn.commit()
         cur.close()
-        
 
     # next do the existing syncs
     # get all the existing syncs
@@ -269,14 +276,19 @@ def syncFilesToRemote(conn, task, tempPlace):
             
             # calulate the size difference (already including deletes technically)
             newSize = int(getDirSize(metadata['name']))
+            oldSize = int(metadata['syncSize'])
+            if newSize > oldSize:
+                newSize = newSize - oldSize
+            else:
+                newSize = oldSize - newSize
             
             cur = conn.cursor()
             cur.execute(f"select * from my_remotes where nickname = '{metadata['remote']}'")
             remote = cur.fetchall()
             cur.close()
-            remainingSize = remote[0]['remaining_space_in_mb']
-            log("Space remaining on remote " + str(remainingSize) + " MB")
-            amountRemaining = int(remainingSize) - 10 # 10mb buffer
+            remainingSize = remote[0]['remaining_space_in_kb']
+            log("Space remaining on remote " + str(remainingSize) + " KB")
+            amountRemaining = int(remainingSize) - 100 # 10mb buffer
             
             if amountRemaining <= newSize:
                 raise Exception("Not enough space on remote for changed files")
@@ -312,7 +324,7 @@ def syncFilesToRemote(conn, task, tempPlace):
             
             if len(individualFilesWithHashesChanges) > 0:
                 cur = conn.cursor()
-                log("insert sync updates task " + str(metadata))
+                log("insert sync updates task " + str(metadata['name']))
                 cur.execute(f"insert into taskqueue (name, task, ts, status, try, retry_ts) values('Sync update', '{json.dumps(metadata)}', NOW(), 'Queued', 0, NOW())")
                 cur.close()
                 
@@ -347,6 +359,14 @@ def syncUpdate(conn, task):
     params = {'name': metadata['remote'], 'token': remote['token']}
     try:
         req = requests.post(f'{addr}/file/syncUpdateFromRemote', params=params, json=sendObj)
+        if req.status_code == 403:
+            # remote is not up currently... delay task until its up
+            with conn.cursor() as cur:
+                minutesUntil = int(json.loads(req.text)['detail'])
+                log(f"sleeping task until remote is ready in {minutesUntil} minutes" + str(task))
+                cur.execute(f"update taskqueue set retry_ts = NOW() + {minutesUntil} * interval '1 minute' where id = {task['id']}")
+                conn.commit()
+            return
         if req.status_code != 200:
             raise Exception
     except:
@@ -361,10 +381,10 @@ def downloadFileFromRemote(conn, task):
     
     # get remaining hosted remote space
     cur = conn.cursor()
-    cur.execute(f"select remaining_space_in_mb from hosted_remotes where nickname = '{task['task']['remote']}'")
+    cur.execute(f"select remaining_space_in_kb from hosted_remotes where nickname = '{task['task']['remote']}'")
     remainingSpace = cur.fetchone()
     cur.close()
-    remainingSpace = remainingSpace['remaining_space_in_mb']
+    remainingSpace = remainingSpace['remaining_space_in_kb']
     
     # open the file (stream it)
     # download the file from the remote api
@@ -383,8 +403,8 @@ def downloadFileFromRemote(conn, task):
 
     # lets not let the disk go below 5% empty space
     diskStat = shutil.disk_usage(task['task']['filePath'])
-    diskTotal = diskStat.total*0.000001
-    diskFree = diskStat.free*0.000001
+    diskTotal = diskStat.total*0.001
+    diskFree = diskStat.free*0.001
     diskRemainingAfterFile = diskFree - sizeNeeded # change to file size
     remainingSpaceAfterFile = remainingSpace - sizeNeeded
     
@@ -422,7 +442,7 @@ def downloadFileFromRemote(conn, task):
     
     # double check the file to see if it took the stated amount of space. if it didn't then delete it
     # and raise error
-    actualSize = os.path.getsize(f"{task['task']['filePath']}/{task['task']['nameFake']}") * 0.000001
+    actualSize = os.path.getsize(f"{task['task']['filePath']}/{task['task']['nameFake']}") * 0.001
     if actualSize > sizeNeeded:
         log(f"File size not as reported by remote server. Deleting the file. ACTUAL SIZE: {actualSize}, STATED SIZE: {sizeNeeded}")
         if os.path.exists(f"{task['task']['filePath']}/{task['task']['nameFake']}"):
@@ -435,8 +455,8 @@ def downloadFileFromRemote(conn, task):
     # increase db space taken and reduce available
     with conn.cursor() as cur:
         cur.execute(f"""update hosted_remotes 
-                        set used_space_in_mb = used_space_in_mb + '{sizeNeeded}', 
-                        remaining_space_in_mb = remaining_space_in_mb - '{sizeNeeded}' 
+                        set used_space_in_kb = used_space_in_kb + '{sizeNeeded}', 
+                        remaining_space_in_kb = remaining_space_in_kb - '{sizeNeeded}' 
                         where nickname = '{task['task']['remote']}'""")
    
     with conn.cursor() as cur:
