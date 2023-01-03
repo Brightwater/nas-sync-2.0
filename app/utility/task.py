@@ -1,6 +1,6 @@
 from math import ceil
 from scheduler import log
-from utility.file import openSslEncryptFile, nameFile, getDirTreeDict, addHashesToTree, getDirSize
+from utility.file import openSslEncryptFile, nameFile, nameFileSeeded, getDirTreeDict, addHashesToTree, getDirSize
 import json
 import pathlib
 import os
@@ -20,25 +20,30 @@ def updateTaskStatus(conn, status, task):
     cur.close()
   
 # recursive tree read
-def fullTreeGetFiles(tree, basePath, individualFilesWithHashes, individualFIlesWithPaths):
+def fullTreeGetFiles(tree, basePath, individualFilesWithHashes, individualFilesWithPaths):
     for item in tree['contents']:
         if item['type'] == "directory" and item['contents'] != None:
-            fullTreeGetFiles(item, basePath+"/"+item['name'], individualFilesWithHashes, individualFIlesWithPaths) 
+            fullTreeGetFiles(item, basePath+"/"+item['name'], individualFilesWithHashes, individualFilesWithPaths) 
         else:
             h = {}
-            h['nameFake'] = item['nameFake']
-            h['hash'] = item['hash']
-            individualFilesWithHashes.append(h)
             f = {}
-            f['nameFake'] = item['nameFake']
+            # temp = ""
+            # temp = nameFileSeeded(basePath+"/"+item['name'])+".enc"
+            # h['nameFake'] = temp
+            # f['nameFake'] = temp
+            # item['nameFake'] = temp
+            h['hash'] = item['hash']
+            h['nameFake'] = item['nameFake']
+            individualFilesWithHashes.append(h)
             f['fullPath'] = basePath+"/"+item['name']
-            individualFIlesWithPaths.append(f)
+            f['nameFake'] = item['nameFake']
+            individualFilesWithPaths.append(f)
               
 # recursive tree read
-def encryptFullTree(tree, basePath, tempPlace, token, individualFilesWithHashes, individualFIlesWithPaths):
+def encryptFullTree(tree, basePath, tempPlace, token, individualFilesWithHashes, individualFilesWithPaths):
     for item in tree['contents']:
         if item['type'] == "directory" and item['contents'] != None:
-            encryptFullTree(item, basePath+"/"+item['name'], tempPlace, token, individualFilesWithHashes, individualFIlesWithPaths) 
+            encryptFullTree(item, basePath+"/"+item['name'], tempPlace, token, individualFilesWithHashes, individualFilesWithPaths) 
         else:
             # encrypt the file here...
             if tempPlace is None:
@@ -56,7 +61,7 @@ def encryptFullTree(tree, basePath, tempPlace, token, individualFilesWithHashes,
             f = {}
             f['nameFake'] = item['nameFake']
             f['fullPath'] = basePath+"/"+item['name']
-            individualFIlesWithPaths.append(f)
+            individualFilesWithPaths.append(f)
 
 def addSyncPathTask(task, tempPlace, conn):
     cur = conn.cursor()
@@ -69,11 +74,11 @@ def addSyncPathTask(task, tempPlace, conn):
     
     # determine if base path is a file or dir
     individualFilesWithHashes = []
-    individualFIlesWithPaths = []
+    individualFilesWithPaths = []
     if task['task']['type'] == 'directory':
         #directory
         log("Base path " + task['task']['name'])
-        encryptFullTree(task['task'], task['task']['name'], tempPlace, token, individualFilesWithHashes, individualFIlesWithPaths)
+        encryptFullTree(task['task'], task['task']['name'], tempPlace, token, individualFilesWithHashes, individualFilesWithPaths)
     else:
         raise Exception("Only dir allowed")
     
@@ -81,7 +86,7 @@ def addSyncPathTask(task, tempPlace, conn):
         tempPlace = task['task']['name']
         
     task['task']['individualFilesWithHashes'] = individualFilesWithHashes
-    task['task']['individualFilesWithPaths'] = individualFIlesWithPaths
+    task['task']['individualFilesWithPaths'] = individualFilesWithPaths
     
     dummyMetadataName = nameFile()
     inp = tempPlace+"/"+"metadata."+dummyMetadataName
@@ -150,16 +155,6 @@ def syncFilesToRemote(conn, task, tempPlace):
     cur.close()
     for sync in newSyncs:
         log("Start sync for newsync " + sync['nickname'])
-        addr = determineAddress(sync['address'], sync['port'])
-        # ping the remote to make sure it's ready
-        params = {'name': sync['nickname'], 'token': sync['token']}
-        try:
-            req = requests.get(f'{addr}/file/checkIfInInterval', params=params)
-            if req.status_code != 200:
-                raise Exception
-        except:
-            log(f"Remote {sync['nickname']} {sync['address']} not up or not accepting syncs currently. Will try again later.")
-            continue
         
         #build object to send the remote
         sendObj = {}
@@ -170,7 +165,7 @@ def syncFilesToRemote(conn, task, tempPlace):
         
         # trigger the sync on the remote
         # and post the files it will need to download
-        
+        addr = determineAddress(sync['address'], sync['port'])
         params = {'name': sync['nickname'], 'token': sync['token']}
         try:
             req = requests.post(f'{addr}/file/syncFromRemote', params=params, json=sendObj)
@@ -206,11 +201,11 @@ def syncFilesToRemote(conn, task, tempPlace):
         # print(metadata)
         
         individualFilesWithHashes = []
-        individualFIlesWithPaths = []
+        individualFilesWithPaths = []
         if metadata['type'] == 'directory':
             #directory
             log("Base path " + metadata['name'])
-            fullTreeGetFiles(tree, tree['name'], individualFilesWithHashes, individualFIlesWithPaths)
+            fullTreeGetFiles(tree, tree['name'], individualFilesWithHashes, individualFilesWithPaths)
         else:
             raise Exception("Only dir supported")
 
@@ -221,29 +216,34 @@ def syncFilesToRemote(conn, task, tempPlace):
             inCount = 0
             origFileExists = False
             for origFile in metadata['individualFilesWithHashes']:
-                if individualFIlesWithPaths[outCount]['fullPath'] == metadata['individualFilesWithPaths'][inCount]['fullPath']:
+                if individualFilesWithPaths[outCount]['fullPath'] == metadata['individualFilesWithPaths'][inCount]['fullPath']:
+                    individualFilesWithPaths[outCount]['nameFake'] = metadata['individualFilesWithPaths'][inCount]['nameFake']
+                    file['nameFake'] = origFile['nameFake']
+                    
                     origFileExists = True
-                    print(file['hash'] + " " + origFile['hash'] + individualFIlesWithPaths[outCount]['fullPath'])
+                    # log(file['hash'] + " " + origFile['hash'] + individualFilesWithPaths[outCount]['fullPath'])
                     # same old file now compare hashes
                     if file['hash'] != origFile['hash']:
                         # file was changed
-                        log(f"File {individualFIlesWithPaths[outCount]} was changed. Will trigger a re sync")
+                        file['status'] = "Update"
+                        log(f"File {individualFilesWithPaths[outCount]} was changed. Will trigger a re sync")
                         individualFilesWithHashesChanges.append(file)
+                        
                         # encrypt the file
-                        err = openSslEncryptFile(token, individualFIlesWithPaths[outCount]['fullPath'], tempPlace+"/"+file['nameFake'])
+                        err = openSslEncryptFile(token, individualFilesWithPaths[outCount]['fullPath'], tempPlace+"/"+file['nameFake'])
                         if err:
-                            print("err got here")
-                            print(err)
                             raise(Exception(err))
                     break
                 inCount = inCount + 1
             if not origFileExists:
                 # this file is new
-                log(f"File {individualFIlesWithPaths[outCount]} is new. Will trigger it to sync")
+                # file['nameFake'] = individualFilesWithPaths[outCount]['nameFake']
+                log(f"File {individualFilesWithPaths[outCount]} is new. Will trigger it to sync")
                 # add the other metadata
+                file['status'] = "New"
                 individualFilesWithHashesChanges.append(file)
                 # encrypt the file
-                err = openSslEncryptFile(token, individualFIlesWithPaths[outCount]['fullPath'], tempPlace+"/"+file['nameFake'])
+                err = openSslEncryptFile(token, individualFilesWithPaths[outCount]['fullPath'], tempPlace+"/"+file['nameFake'])
                 if err:
                     print("err got here")
                     print(err)
@@ -251,10 +251,11 @@ def syncFilesToRemote(conn, task, tempPlace):
             outCount = outCount + 1
             
         filesToMarkDelete = []
+        notifyDeleteObj = []
         # next check for any deleted files
-        for origFile in metadata['individualFilesWithPaths']:
+        for count, origFile in enumerate(metadata['individualFilesWithPaths']):
             fileStillExists = False
-            for file in individualFIlesWithPaths:
+            for file in individualFilesWithPaths:
                 if file['fullPath'] == origFile['fullPath']:
                     fileStillExists = True
                     break
@@ -262,9 +263,8 @@ def syncFilesToRemote(conn, task, tempPlace):
                 # file was deleted but in case something went wrong will notify the user before remote deletion happens
                 log(f"File {origFile['fullPath']} was deleted locally. Will log the file to be deleted on remote after confirmation")
                 filesToMarkDelete.append(origFile)
-                
-        
-            
+                notifyDeleteObj.append(origFile['nameFake'])
+                    
         if len(individualFilesWithHashesChanges) > 0 or len(filesToMarkDelete) > 0:
             
             # calulate the size difference (already including deletes technically)
@@ -281,19 +281,14 @@ def syncFilesToRemote(conn, task, tempPlace):
             if amountRemaining <= newSize:
                 raise Exception("Not enough space on remote for changed files")
             
-            # handle the changed
-            changedData = {}
-            changedData['fileChanges'] = individualFilesWithHashesChanges
-            changedData['remoteName'] = metadata['remote']
-            changedData['syncName'] = metadata['syncFakeName']
-            
-            
             # update the metadata...
             # props to update: contents, individualFilesWithPaths, individualFilesWithHashes
-            if metadata['contents'] != None:
-                metadata['contents'] = tree['contents']
-            metadata['individualFilesWithPaths'] = individualFIlesWithPaths
+            metadata['contents'] = tree['contents']
+            metadata['individualFilesWithPaths'] = individualFilesWithPaths
             metadata['individualFilesWithHashes'] = individualFilesWithHashes
+            metadata['fileChanges'] = individualFilesWithHashesChanges
+            metadata['pendingDeletes'] = notifyDeleteObj
+            metadata['syncSize'] = newSize
             
             dummyMetadataName = metadata['syncFakeName']
             inp = tempPlace+"/"+"metadata."+dummyMetadataName
@@ -308,8 +303,6 @@ def syncFilesToRemote(conn, task, tempPlace):
                 raise(Exception(err))
             os.remove(inp+".json")
             
-            # for these we'll just start up separate tasks since this one is way too long. (DRY right? kek)
-            
             if len(filesToMarkDelete) > 0:
                 # handle the deleted 
                 cur = conn.cursor()
@@ -319,8 +312,8 @@ def syncFilesToRemote(conn, task, tempPlace):
             
             if len(individualFilesWithHashesChanges) > 0:
                 cur = conn.cursor()
-                log("insert sync updates task " + str(changedData))
-                cur.execute(f"insert into taskqueue (name, task, ts, status, try, retry_ts) values('Sync update', '{json.dumps(changedData)}', NOW(), 'Queued', 0, NOW())")
+                log("insert sync updates task " + str(metadata))
+                cur.execute(f"insert into taskqueue (name, task, ts, status, try, retry_ts) values('Sync update', '{json.dumps(metadata)}', NOW(), 'Queued', 0, NOW())")
                 cur.close()
                 
             conn.commit()
@@ -332,6 +325,36 @@ def syncFilesToRemote(conn, task, tempPlace):
     
 def syncUpdate(conn, task):
     log("In sync update")
+    
+    cur = conn.cursor()
+    cur.execute(f"select * from my_remotes where nickname = '{task['task']['remote']}'")
+    remote = cur.fetchone()
+    cur.close()
+    
+    metadata = task['task']
+    
+    # build object to send the remote
+    sendObj = {}
+    sendObj['syncSize'] = metadata['syncSize']
+    sendObj['name'] = metadata['syncFakeName']
+    sendObj['metadataFileName'] = metadata['metadataFileName']
+    sendObj['fileChanges'] = metadata['fileChanges']
+    sendObj['pendingDeletes'] = metadata['pendingDeletes']
+    
+    # trigger the sync on the remote
+    # and post the files it will need to download
+    addr = determineAddress(remote['address'], remote['port'])
+    params = {'name': metadata['remote'], 'token': remote['token']}
+    try:
+        req = requests.post(f'{addr}/file/syncUpdateFromRemote', params=params, json=sendObj)
+        if req.status_code != 200:
+            raise Exception
+    except:
+        log(f"Remote {metadata['remote']} not up or not accepting syncs currently. Will try again later.")
+        raise Exception
+    
+    updateTaskStatus(conn, 'Syncing', task)
+    
     
 def downloadFileFromRemote(conn, task):
     log(f"Starting file download for fake name {task['task']['nameFake']}")
@@ -366,7 +389,14 @@ def downloadFileFromRemote(conn, task):
     remainingSpaceAfterFile = remainingSpace - sizeNeeded
     
     if diskRemainingAfterFile / diskTotal <= 0.05 or remainingSpaceAfterFile <= 0:  
-        raise Exception(f"Not enough space on disk for the file")  
+        raise Exception(f"Not enough space on disk for the file")
+    
+    oldFileSize = None
+    if 'status' in task['task'] and task['task']['status'] == 'Update':
+        # print(f"{task['task']['filePath']}/{task['task']['nameFake']}")
+        oldFileSize = getDirSize(f"{task['task']['filePath']}/{task['task']['nameFake']}")
+        # print(oldFileSize)
+        oldFileSize = int(oldFileSize)
     
     try:
         # Create a request object with the URL
@@ -399,26 +429,42 @@ def downloadFileFromRemote(conn, task):
             os.remove(f"{task['task']['filePath']}/{task['task']['nameFake']}")
         raise Exception("Incorrectly sized file from remote")
     
+    if oldFileSize:
+        actualSize = actualSize - oldFileSize
+    
     # increase db space taken and reduce available
-    cur = conn.cursor()
-    cur.execute(f"""update hosted_remotes 
-                    set used_space_in_mb = used_space_in_mb + '{sizeNeeded}', 
-                    remaining_space_in_mb = remaining_space_in_mb - '{sizeNeeded}' 
-                    where nickname = '{task['task']['remote']}'""")
-    cur.close()
+    with conn.cursor() as cur:
+        cur.execute(f"""update hosted_remotes 
+                        set used_space_in_mb = used_space_in_mb + '{sizeNeeded}', 
+                        remaining_space_in_mb = remaining_space_in_mb - '{sizeNeeded}' 
+                        where nickname = '{task['task']['remote']}'""")
+   
+    with conn.cursor() as cur:
+        cur.execute(f"""update hosted_syncs 
+                        set size = size + {sizeNeeded}
+                        where name = '{task['task']['syncName']}'""")
+    
     conn.commit()
     
     if task['task']['index'] == task['task']['numInSync']:
         log("last file in sync reached")
         # mark the sync as synced
-        cur = conn.cursor()
-        cur.execute(f"""update hosted_syncs 
-                        set status = 'Synced'
-                        where name = '{task['task']['syncName']}'""")
-        cur.close()
+        
+        with conn.cursor() as cur:
+            cur.execute(f"""update hosted_syncs 
+                            set status = 'Synced'
+                            where name = '{task['task']['syncName']}'""")
         conn.commit()
-        # notify the remote that the sync is completely retrieved
-        params = {'name': task['task']['remote'], 'token': task['task']['token'], 'syncName': task['task']['syncName']}
+        usedSpace = 0
+        with conn.cursor() as cur:
+            cur.execute(f"""select size from hosted_syncs where name = '{task['task']['syncName']}'""")
+            usedSpace = int(cur.fetchone()['size'])
+        isUpdate = False
+        if 'status' in task['task']:
+            isUpdate = True
+        # notify the remote that the sync is completely retrieved and tell it what the new size is
+        params = {'name': task['task']['remote'], 'token': task['task']['token'], 
+                    'syncName': task['task']['syncName'], 'isUpdate': isUpdate, 'usedSpace': usedSpace}
         req = requests.get(f"{addr}/file/notifySyncComplete", params=params)
         if req.status_code != 200:
             log(f"Remote {task['task']['remote']} not up or not accepting syncs currently. Will try again later. The actual error code was: {req.status_code}")
@@ -426,22 +472,49 @@ def downloadFileFromRemote(conn, task):
     
     updateTaskStatus(conn, 'Complete', task)
     
+# def determineSyncSizeForPendingDeletes(conn, task):
+    
+#     syncSizeObj = task['task']
+#     sizeOfDels = 0
+#     for delObj in syncSizeObj:
+#         size = getDirSize(f"{syncSizeObj['filePath']}/{delObj}")
+#         sizeOfDels = sizeOfDels + size
+    
+#     log(f"Size of all the pending deletes in sync {syncSizeObj['syncName']}")
+#     data = {}
+#     data['sizeofDels'] = sizeOfDels
+    
+#     cur = conn.cursor()
+#     cur.execute(f"update taskqueue set status = '{status}', task = '{json.dumps(data)}' where id = {task['id']}")
+#     conn.commit()
+#     cur.close()
+        
 # delete temp files and complete the task
 def cleanupNewSync(task, tempPlace, conn):
     if tempPlace is None:
         tempPlace = task['task']['name']
         
-    for file in task['task']['individualFilesWithPaths']:
-        fakeName = file['nameFake']
-        if os.path.exists(f"{tempPlace}/{fakeName}"):
-            log(f"Removing temporary file: {tempPlace}/{fakeName}")
-            os.remove(f"{tempPlace}/{fakeName}")
-        else:
-            log(f"Temp file not found {tempPlace}/{fakeName}")
+    if task['name'] == "Add sync path":
+        for file in task['task']['individualFilesWithPaths']:
+            fakeName = file['nameFake']
+            if os.path.exists(f"{tempPlace}/{fakeName}"):
+                log(f"Removing temporary file: {tempPlace}/{fakeName}")
+                os.remove(f"{tempPlace}/{fakeName}")
+            else:
+                log(f"Temp file not found {tempPlace}/{fakeName}")
+    else:
+        for file in task['task']['fileChanges']:
+            fakeName = file['nameFake']
+            if os.path.exists(f"{tempPlace}/{fakeName}"):
+                log(f"Removing temporary file: {tempPlace}/{fakeName}")
+                os.remove(f"{tempPlace}/{fakeName}")
+            else:
+                log(f"Temp file not found {tempPlace}/{fakeName}")
     # clean metadata file
     if os.path.exists(f"{task['task']['metadataFilePath']}"):
-            log(f"Removing temporary file: {task['task']['metadataFilePath']}")
-            os.remove(f"{task['task']['metadataFilePath']}")
+        log(f"Removing temporary file: {task['task']['metadataFilePath']}")
+        os.remove(f"{task['task']['metadataFilePath']}")
+                
     log("Cleaned up files in sync {task}.")
             
     updateTaskStatus(conn, 'Complete', task)

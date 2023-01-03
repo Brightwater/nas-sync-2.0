@@ -28,3 +28,10 @@ class SyncData(BaseModel):
     metadataFileName: str = Field(None, title="metadataFileName")
     name: str = Field(None, title="name")
     individualFilesWithHashes: List[Dict[str, str]] = Field([], title="individualFilesWithHashes")
+    
+class SyncUpdateData(BaseModel):
+    syncSize: int = Field(None, title="syncSize")
+    metadataFileName: str = Field(None, title="metadataFileName")
+    name: str = Field(None, title="name")
+    fileChanges: List[Dict[str, str]] = Field([], title="fileChanges")
+    pendingDeletes: List[str]

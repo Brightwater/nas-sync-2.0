@@ -46,7 +46,7 @@ def processTask(task):
         if name == 'Add sync path' and task['status'] != 'Cleaning up':
             addSyncPathTask(task, TEMP_PATH, conn)
         
-        elif name == 'Add sync path' and task['status'] == 'Cleaning up':
+        elif (name == 'Add sync path' or name == 'Sync update') and task['status'] == 'Cleaning up':
             cleanupNewSync(task, TEMP_PATH, conn)
           
         elif name == 'Sync':
@@ -55,8 +55,11 @@ def processTask(task):
         elif name == 'Retrive file from remote':
             downloadFileFromRemote(conn, task)
             
-        elif name == 'Sync update':
-            syncUpdate(conn, task)    
+        elif name == 'Sync update' and task['status'] != 'Cleaning up':
+            syncUpdate(conn, task)
+            
+        # elif name == 'Determine pending deletes size':
+        #     determineSyncSizeForPendingDeletes(conn, task)    
             
         else:
             # probably shouldn't be a real thing
@@ -78,10 +81,11 @@ def readTaskQueue():
                     and status <> 'Complete' 
                     and status <> 'Syncing'
                     and NOW() >= retry_ts
-                    order by ts asc""")
+                    order by ts asc
+                    limit 1""")
         task = cur.fetchone()
         cur.close()
-        
+        print(task)
         if task:
             cur = conn.cursor()
             tryNum = int(task['try']) + 1
