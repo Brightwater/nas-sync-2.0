@@ -6,6 +6,7 @@ import pathlib
 import os
 import requests
 import shutil
+import psycopg
 
 def determineAddress(address, port):
     if port == None or port == "":
@@ -62,8 +63,66 @@ def encryptFullTree(tree, basePath, tempPlace, token, individualFilesWithHashes,
             f['nameFake'] = item['nameFake']
             f['fullPath'] = basePath+"/"+item['name']
             individualFilesWithPaths.append(f)
+            
+# def injectFileInContentsRecursive2(folderNameToFind, contents: list, thisStepPath, fileObj):
+#     thisFolderName = os.path.basename(thisStepPath)
+#     if thisFolderName == folderNameToFind:
+#         # found here
+#         contents.append(fileObj)
+#         return True
+#     for nested in contents:
+#         if nested['type'] == 'directory':
+#             found = injectFileInContentsRecursive2(folderNameToFind, contents, thisStepPath+"/"+nested['name'], fileObj)
+#             if found:
+#                 return True
+#     return False
 
-def addSyncPathTask(task, tempPlace, conn):
+def delFileInContentsRecursive(relPathSplit, contents: list, fakeName):
+    if len(relPathSplit) == 1:
+        # final folder found
+        for file in contents:
+            if file['nameFake'] == fakeName:
+                contents.remove(file)
+                break
+        return
+    for element in contents:
+        if element['type'] == 'directory' and relPathSplit[1] == element['name']:
+            delFileInContentsRecursive(relPathSplit[1:], element['contents'], fakeName)
+
+def injectDelFileInContentsRecursive(relPathSplit, contents: list, fileObj):
+    if len(relPathSplit) == 1:
+        # final folder found
+        log("FOUND NEW FILE LOCATION")
+        contents.append(fileObj)
+        return
+    found = False
+    for element in contents:
+        if element['type'] == 'directory' and relPathSplit[1] == element['name']:
+            injectDelFileInContentsRecursive(relPathSplit[1:], element['contents'], fileObj)
+            found = True
+            return
+    if not found:
+        # need to create remainder of path
+        dirObj = {'name': relPathSplit[1], 'type': 'directory', 'contents': []}
+        contents.append(dirObj)
+        injectDelFileInContentsRecursive(relPathSplit[1:], dirObj['contents'], fileObj)
+        
+
+def placeDelFileInMetadata(filePath, rootPath: str, contents: list, fileObj):
+    relPath = os.path.relpath(filePath, start=rootPath)
+    relPathSplit = str(relPath).split("/")[:-1] # remove last element (the file itself) so we can find the folder
+    relPathSplit.insert(0, os.path.basename(rootPath)) 
+    log("RELPATH " + str(relPathSplit))
+    injectDelFileInContentsRecursive(relPathSplit, contents, fileObj)
+    
+def removeDelFileInMetadata(filePath, rootPath: str, contents: list, fakeName):
+    relPath = os.path.relpath(filePath, start=rootPath)
+    relPathSplit = str(relPath).split("/")[:-1] # remove last element (the file itself) so we can find the folder
+    relPathSplit.insert(0, os.path.basename(rootPath)) 
+    log("RELPATH " + str(relPathSplit))
+    delFileInContentsRecursive(relPathSplit, contents, fakeName)
+
+def addSyncPathTask(conn, task, tempPlace):
     cur = conn.cursor()
     cur.execute(f"select file_encryption_key from authenticated_user where 'admin' = any(scopes)")
     token = cur.fetchone()
@@ -112,7 +171,7 @@ def addSyncPathTask(task, tempPlace, conn):
     conn.commit()
     cur.close()
     
-def syncFilesToRemote(conn, task, tempPlace):
+def syncFilesToRemote(conn: psycopg.connection, task, tempPlace):
     cur = conn.cursor()
     cur.execute(f"select file_encryption_key from authenticated_user where 'admin' = any(scopes)")
     token = cur.fetchone()
@@ -244,7 +303,6 @@ def syncFilesToRemote(conn, task, tempPlace):
                 inCount = inCount + 1
             if not origFileExists:
                 # this file is new
-                # file['nameFake'] = individualFilesWithPaths[outCount]['nameFake']
                 log(f"File {individualFilesWithPaths[outCount]} is new. Will trigger it to sync")
                 # add the other metadata
                 file['status'] = "New"
@@ -258,7 +316,7 @@ def syncFilesToRemote(conn, task, tempPlace):
             outCount = outCount + 1
             
         filesToMarkDelete = []
-        notifyDeleteObj = []
+            
         # next check for any deleted files
         for count, origFile in enumerate(metadata['individualFilesWithPaths']):
             fileStillExists = False
@@ -270,9 +328,22 @@ def syncFilesToRemote(conn, task, tempPlace):
                 # file was deleted but in case something went wrong will notify the user before remote deletion happens
                 log(f"File {origFile['fullPath']} was deleted locally. Will log the file to be deleted on remote after confirmation")
                 filesToMarkDelete.append(origFile)
-                notifyDeleteObj.append(origFile['nameFake'])
                     
-        if len(individualFilesWithHashesChanges) > 0 or len(filesToMarkDelete) > 0:
+        confirmedDelList = []
+        print("GOT")
+        with conn.cursor() as cur:
+            cur.execute(f"select * from pending_file_deletes where sync = '{metadata['syncFakeName']}'")
+            pd = cur.fetchone()
+            print("HERE")
+            print(pd)
+            if pd:
+                if pd['confirmed'] == 'Y':
+                    print(pd['metadata'])
+                    confirmedDelList = pd['metadata']
+                else:
+                    filesToMarkDelete.append(pd['metadata'])             
+                         
+        if len(individualFilesWithHashesChanges) > 0 or len(filesToMarkDelete) > 0 or len(confirmedDelList) > 0:
             
             # calulate the size difference (already including deletes technically)
             newSize = int(getDirSize(metadata['name']))
@@ -293,40 +364,67 @@ def syncFilesToRemote(conn, task, tempPlace):
             if amountRemaining <= newSize:
                 raise Exception("Not enough space on remote for changed files")
             
+            for d in filesToMarkDelete:
+                # add the delete back to metadata so remote can still track it until delete is finalized
+                fileObj = { 'hash': None, 
+                            'name': os.path.basename(d['fullPath']),
+                            'type': None,
+                            'markedDelete': True,
+                            'nameFake': d['nameFake']}
+                placeDelFileInMetadata(d['fullPath'], tree['name'], tree['contents'], fileObj)
+                
             # update the metadata...
             # props to update: contents, individualFilesWithPaths, individualFilesWithHashes
             metadata['contents'] = tree['contents']
             metadata['individualFilesWithPaths'] = individualFilesWithPaths
             metadata['individualFilesWithHashes'] = individualFilesWithHashes
             metadata['fileChanges'] = individualFilesWithHashesChanges
-            metadata['pendingDeletes'] = notifyDeleteObj
+            if len(confirmedDelList) > 0:
+                metadata['pendingDeletes'] = confirmedDelList
+            else:
+                metadata['pendingDeletes'] = None
             metadata['syncSize'] = newSize
             
-            dummyMetadataName = metadata['syncFakeName']
-            inp = tempPlace+"/"+"metadata."+dummyMetadataName
-            log("creating metadata json file for sync update")
-            # create metadata file
-            with open(inp+".json", "w") as metadataFile:
-                data = json.dumps(metadata)
-                metadataFile.write(data)
-            # encrypt the metadata file
-            err = openSslEncryptFile(token, inp+".json", inp+".enc")
-            if err:
-                raise(Exception(err))
-            os.remove(inp+".json")
-            
             if len(filesToMarkDelete) > 0:
-                # handle the deleted 
-                cur = conn.cursor()
+                # handle the new deleted 
                 log("insert pending deleted " + str(filesToMarkDelete))
-                cur.execute(f"insert into pending_file_deletes (remote, sync, metadata) values('{metadata['remote']}', '{metadata['syncFakeName']}', '{json.dumps(filesToMarkDelete)}')")
-                cur.close()
+                try: # delete old deletes for this sync
+                    with conn.cursor() as cur:
+                        cur.execute(f"delete from pending_file_deletes where sync = '{metadata['syncFakeName']}'")
+                except:
+                    pass
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(f"insert into pending_file_deletes (remote, sync, metadata) values('{metadata['remote']}', '{metadata['syncFakeName']}', '{json.dumps(filesToMarkDelete)}')")
+                except:
+                    pass
+                # if nothing else was changed besides deletes,
+                # go ahead and just update metadata for when 
+                # we run sync update again
+                if len(individualFilesWithHashesChanges) == 0 and len(confirmedDelList) == 0:
+                    with conn.cursor() as cur:
+                        cur.execute(f"""update my_syncs
+                                        set metadata = '{json.dumps(metadata)}'
+                                        where name = '{metadata['syncFakeName']}'""")
             
-            if len(individualFilesWithHashesChanges) > 0:
-                cur = conn.cursor()
-                log("insert sync updates task " + str(metadata['name']))
-                cur.execute(f"insert into taskqueue (name, task, ts, status, try, retry_ts) values('Sync update', '{json.dumps(metadata)}', NOW(), 'Queued', 0, NOW())")
-                cur.close()
+            
+            if len(individualFilesWithHashesChanges) > 0 or len(confirmedDelList) > 0:
+                dummyMetadataName = metadata['syncFakeName']
+                inp = tempPlace+"/"+"metadata."+dummyMetadataName
+                log("creating metadata json file for sync update")
+                # create metadata file
+                with open(inp+".json", "w") as metadataFile:
+                    data = json.dumps(metadata)
+                    metadataFile.write(data)
+                # encrypt the metadata file
+                err = openSslEncryptFile(token, inp+".json", inp+".enc")
+                if err:
+                    raise(Exception(err))
+                os.remove(inp+".json")
+                
+                with conn.cursor() as cur:
+                    log("insert sync updates task " + str(metadata['name']))
+                    cur.execute(f"insert into taskqueue (name, task, ts, status, try, retry_ts) values('Sync update', '{json.dumps(metadata)}', NOW(), 'Queued', 0, NOW())")
                 
             conn.commit()
         else:
@@ -338,10 +436,9 @@ def syncFilesToRemote(conn, task, tempPlace):
 def syncUpdate(conn, task):
     log("In sync update")
     
-    cur = conn.cursor()
-    cur.execute(f"select * from my_remotes where nickname = '{task['task']['remote']}'")
-    remote = cur.fetchone()
-    cur.close()
+    with conn.cursor() as cur:
+        cur.execute(f"select * from my_remotes where nickname = '{task['task']['remote']}'")
+        remote = cur.fetchone()
     
     metadata = task['task']
     
@@ -351,7 +448,10 @@ def syncUpdate(conn, task):
     sendObj['name'] = metadata['syncFakeName']
     sendObj['metadataFileName'] = metadata['metadataFileName']
     sendObj['fileChanges'] = metadata['fileChanges']
-    sendObj['pendingDeletes'] = metadata['pendingDeletes']
+    delList = []
+    for d in metadata['pendingDeletes']:
+        delList.append(d['nameFake'])
+    sendObj['pendingDeletes'] = delList
     
     # trigger the sync on the remote
     # and post the files it will need to download
@@ -492,6 +592,46 @@ def downloadFileFromRemote(conn, task):
     
     updateTaskStatus(conn, 'Complete', task)
     
+def deleteSyncFiles(conn: psycopg.connection, task):
+    metadata = task['task']
+    files = []
+    # get sync data
+    with conn.cursor() as cur:
+        cur.execute(f"""select * from hosted_syncs where name = '{metadata['syncName']}'""")
+        files = cur.fetchone()
+        files = files['files']
+        print(files)
+    
+    for delFile in metadata['pendingDeletes']:
+        # get file size on disk.
+        actualSize = os.path.getsize(f"{metadata['filePath']}/{delFile}") * 0.001
+        
+        # delete file from disk
+        if os.path.exists(f"{metadata['filePath']}/{delFile}"):
+            os.remove(f"{metadata['filePath']}/{delFile}")
+            log("Removing the file as remote requested. File fake name: " + delFile)
+            
+        # remove file from files list
+        for file in files:
+            if file['nameFake'] == delFile:
+                files.remove(file)
+                
+        # update sync data
+        # decreate db space taken and increase available
+        with conn.cursor() as cur:
+            cur.execute(f"""update hosted_remotes 
+                            set used_space_in_kb = used_space_in_kb - '{actualSize}', 
+                            remaining_space_in_kb = remaining_space_in_kb + '{actualSize}' 
+                            where nickname = '{metadata['remoteName']}'""")
+    
+        with conn.cursor() as cur:
+            cur.execute(f"""update hosted_syncs 
+                            set size = size - {actualSize}
+                            where name = '{metadata['syncName']}'""")
+        conn.commit()
+        
+    updateTaskStatus(conn, 'Complete', task) 
+    
 # def determineSyncSizeForPendingDeletes(conn, task):
     
 #     syncSizeObj = task['task']
@@ -510,7 +650,7 @@ def downloadFileFromRemote(conn, task):
 #     cur.close()
         
 # delete temp files and complete the task
-def cleanupNewSync(task, tempPlace, conn):
+def cleanupNewSync(conn, task, tempPlace):
     if tempPlace is None:
         tempPlace = task['task']['name']
         
@@ -538,3 +678,76 @@ def cleanupNewSync(task, tempPlace, conn):
     log("Cleaned up files in sync {task}.")
             
     updateTaskStatus(conn, 'Complete', task)
+    
+def addSyncPathGetSubTask(task, TEMP_PATH, conn):
+    if task['status'] == 'Cleaning up':
+        cleanupNewSync(conn, task, TEMP_PATH)
+    else:
+        addSyncPathTask(conn, task, TEMP_PATH)
+        
+def syncUpdateGetSubTask(task, TEMP_PATH, conn):
+    if task['status'] == 'Cleaning up':
+        cleanupNewSync(conn, task, TEMP_PATH)
+    else:
+        syncUpdate(conn, task)
+        
+# def triggerFileDelete(conn: psycopg.Connection, task, tempPlace):
+    
+#     metadata = task['task']
+#     with conn.cursor() as cur:
+#         cur.execute(f"select * from my_remotes where nickname = '{metadata['remote']}'")
+#         remote = cur.fetchone()
+    
+#     with conn.cursor() as cur:
+#         cur.execute(f"select file_encryption_key from authenticated_user where 'admin' = any(scopes)")
+#         token = cur.fetchone()
+#     if token is None:
+#         raise Exception('No admin key found')
+#     token = token['file_encryption_key']
+    
+#     with conn.cursor() as cur:
+#         cur.execute(f"select metadata from my_syncs where name = '{metadata['sync']}'")
+#         syncmetadata = json.loads(cur.fetchone())   
+    
+#     sendDelObj = {}
+#     delList = []
+#     for d in json.loads(metadata['metadata']):
+#         # update metadata and remove the file from the thing
+#         removeDelFileInMetadata(d['fullPath'], syncmetadata['name'], syncmetadata['contents'], d['nameFake'])
+#         delList.append(d['nameFake'])
+        
+#     dummyMetadataName = syncmetadata['syncFakeName']
+#     inp = tempPlace+"/"+"metadata."+dummyMetadataName
+#     log("creating metadata json file for sync update")
+#     # create metadata file
+#     with open(inp+".json", "w") as metadataFile:
+#         data = json.dumps(syncmetadata)
+#         metadataFile.write(data)
+#     # encrypt the metadata file
+#     err = openSslEncryptFile(token, inp+".json", inp+".enc")
+#     if err:
+#         raise(Exception(err))
+#     os.remove(inp+".json")
+    
+#     sendDelObj['delList'] = delList
+#     sendDelObj['syncName'] = metadata['sync']
+    
+    
+#     print(json.dumps(sendDelObj))
+#     addr = determineAddress(remote['address'], remote['port'])
+#     params = {'name': metadata['remote'], 'token': remote['token']}
+#     try:
+#         req = requests.post(f'{addr}/file/syncUpdateFromRemote', params=params, json=sendDelObj)
+#         if req.status_code == 403:
+#             # remote is not up currently... delay task until its up
+#             with conn.cursor() as cur:
+#                 minutesUntil = int(json.loads(req.text)['detail'])
+#                 log(f"sleeping task until remote is ready in {minutesUntil} minutes" + str(task))
+#                 cur.execute(f"update taskqueue set retry_ts = NOW() + {minutesUntil} * interval '1 minute' where id = {task['id']}")
+#                 conn.commit()
+#             return
+#         if req.status_code != 200:
+#             raise Exception
+#     except:
+#         log(f"Remote {metadata['remote']} not up or not accepting syncs currently. Will try again later.")
+#         raise Exception

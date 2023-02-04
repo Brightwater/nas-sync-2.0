@@ -12,7 +12,7 @@ from utility.database import database
 from fastapi.concurrency import run_in_threadpool
 import subprocess
 import json
-from model.pydantics import SyncUpdateData, Token, SyncData
+from model.pydantics import SyncUpdateData, Token, SyncData, DeleteSync
 from datetime import datetime, time, timedelta
 
 CHUNK_SIZE = 1024 * 1024 # 1MB
@@ -310,7 +310,7 @@ async def syncFromRemote(name: str, token: str, sync: SyncData, request: Request
         taskObj['numInSync'] = len(sync.individualFilesWithHashes) - 1
         taskObj['syncName'] = sync.name
 
-        await database.execute(f"insert into taskqueue (name, task, ts, status, try, retry_ts) values('Retrive file from remote', '{json.dumps(taskObj)}', NOW(), 'Queued', 0, NOW())")
+        await database.execute(f"insert into taskqueue (name, task, ts, status, try, retry_ts) values('Retrieve file from remote', '{json.dumps(taskObj)}', NOW(), 'Queued', 0, NOW())")
 
     return json.dumps(sync.individualFilesWithHashes)
 
@@ -359,6 +359,11 @@ async def syncUpdateFromRemote(name: str, token: str, sync: SyncUpdateData, requ
     # syncSizeObj['usedSpace'] = f['used_space_in_kb']
     # await database.execute(f"insert into taskqueue (name, task, ts, status, try, retry_ts) values('Determine pending deletes size', '{json.dumps(syncSizeObj)}', NOW(), 'Queued', 0, NOW())")
 
+    if len(sync.pendingDeletes) > 0:
+        delObj = {'pendingDeletes': sync.pendingDeletes, 'remoteName': name, 'syncName': sync.name, 'filePath': f['filepath']}
+        await database.execute(f"insert into taskqueue (name, task, ts, status, try, retry_ts) values('Delete sync files', '{json.dumps(delObj)}', NOW(), 'Queued', 0, NOW())")
+    
+
     # create tasks for all the files for the taskrunner to process
     
     for i, file in enumerate(sync.fileChanges):
@@ -377,35 +382,36 @@ async def syncUpdateFromRemote(name: str, token: str, sync: SyncUpdateData, requ
         taskObj['syncName'] = sync.name
 
         # does this work without await??
-        await database.execute(f"insert into taskqueue (name, task, ts, status, try, retry_ts) values('Retrive file from remote', '{json.dumps(taskObj)}', NOW(), 'Queued', 0, NOW())")
+        await database.execute(f"insert into taskqueue (name, task, ts, status, try, retry_ts) values('Retrieve file from remote', '{json.dumps(taskObj)}', NOW(), 'Queued', 0, NOW())")
 
-    return json.dumps(sync.fileChanges)
-
-
-@router.get("/testDirThing")
-async def test():
-    tree = await run_in_threadpool(lambda: getDirTreeDict("/home/jeremiah/development/nas-share2.0"))
-    await run_in_threadpool(lambda: addHashesToTree(tree, tree['name']))
-    #await database.execute(f"insert into documents (data) values('{json.dumps(tree)}')")
-
-    return tree
-
-@router.get("/encryptionTest")
-async def encryptionTest():
-    token = await database.fetch_one(f"select password from authenticated_user where username = 'Jeremiah'")
-    token = token.password
     
-    inputFilePath = "/home/jeremiah/development/nas-share2.0/samplee.txt"
-    outPutFilePath = "/home/jeremiah/development/nas-share2.0/sample.txt.enc"
-    
-    fileHash = await run_in_threadpool(lambda: computeMd5FileHash(inputFilePath))
-    #await run_in_threadpool(lambda: print(fileHash))
-    
-    await run_in_threadpool(lambda: openSslEncryptFile(token, inputFilePath, outPutFilePath))
-    inputFilePath = "/home/jeremiah/development/nas-share2.0/sample.txt.enc"
-    outPutFilePath = "/home/jeremiah/development/nas-share2.0/sample_decrypted.mp4"
-    await run_in_threadpool(lambda: openSslDecryptFile(token, inputFilePath, outPutFilePath))
-    return fileHash
+    return "OK"
+
+
+# @router.get("/testDirThing")
+# async def test():
+#     tree = await run_in_threadpool(lambda: getDirTreeDict("/home/jeremiah/development/nas-share2.0"))
+#     await run_in_threadpool(lambda: addHashesToTree(tree, tree['name']))
+#     #await database.execute(f"insert into documents (data) values('{json.dumps(tree)}')")
+
+#     return tree
+
+# @router.get("/encryptionTest")
+# async def encryptionTest():
+#     token = await database.fetch_one(f"select password from authenticated_user where username = 'Jeremiah'")
+#     token = token.password
+    # 
+#     inputFilePath = "/home/jeremiah/development/nas-share2.0/samplee.txt"
+#     outPutFilePath = "/home/jeremiah/development/nas-share2.0/sample.txt.enc"
+    # 
+#     fileHash = await run_in_threadpool(lambda: computeMd5FileHash(inputFilePath))
+#     #await run_in_threadpool(lambda: print(fileHash))
+    # 
+#     await run_in_threadpool(lambda: openSslEncryptFile(token, inputFilePath, outPutFilePath))
+#     inputFilePath = "/home/jeremiah/development/nas-share2.0/sample.txt.enc"
+#     outPutFilePath = "/home/jeremiah/development/nas-share2.0/sample_decrypted.mp4"
+#     await run_in_threadpool(lambda: openSslDecryptFile(token, inputFilePath, outPutFilePath))
+    # return fileHash
 
 @router.get("/getFileSize")
 async def checkFileSize(name: str, token: str, fakeName: str, request: Request):
@@ -417,6 +423,42 @@ async def checkFileSize(name: str, token: str, fakeName: str, request: Request):
         )
     filePath = await getSyncFileFromFakeName(name, fakeName)
     return await run_in_threadpool(lambda: os.path.getsize(filePath) * 0.001)
+
+@router.get("/getPendingDeletes")
+async def getPendingDeletes(token: str, request: Request):
+    # change to just jwt later
+    if not await verifyJwtOrLocal(token, request):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    # query db for pending del files
+    pendingDels = await database.fetch_all(f"select * from pending_file_deletes where confirmed is null")
+    
+    return pendingDels
+
+@router.get("/acceptDelete")
+async def acceptDeleteFromUser(token: str, deleteId: int, request: Request):
+    # change to just jwt later
+    if not await verifyJwtOrLocal(token, request):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    # insert task for the pending delete
+    # things needed:
+    # namefakes for all del files (metadata)
+    # remote name
+    # sync name
+    # await database.execute(f"""insert into taskqueue 
+    #                         (name, task, ts, status, try, retry_ts) 
+    #                         values('Sync delete', '{json.dumps(pendingDel)}', NOW(), 'Queued', 0, NOW())""")
+
+    # update the pending del
+    await database.execute(f"""update pending_file_deletes set confirmed = 'Y' where id = {deleteId}""")
 
 @router.get("/notifySyncComplete")
 async def notifySyncComplete(name: str, token: str, syncName: str, isUpdate: bool, usedSpace: int, request: Request):
@@ -517,11 +559,11 @@ async def hostFileDownloadForSync(name: str, token: str, fakeName: str, request:
     headers = {'Content-Disposition': f'attachment; filename="{fakeName}"'}
     return StreamingResponse(iterfile(), headers=headers, media_type='application/octet-stream')
 
-@router.get("deleteSyncFileBlock")
-async def deleteFileBlock(name: str, token: str, request: Request):
-    if not await verifyRemote(name, token, request):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Incorrect username or password",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+# @router.get("deleteSyncFileBlock")
+# async def deleteFileBlock(name: str, token: str, request: Request):
+#     if not await verifyRemote(name, token, request):
+#             raise HTTPException(
+#                 status_code=status.HTTP_401_UNAUTHORIZED,
+#                 detail="Incorrect username or password",
+#                 headers={"WWW-Authenticate": "Bearer"},
+#             )

@@ -14,6 +14,7 @@ TEMP_WITH_ORIGINAL = True
 TEMP_PATH = None
 conn = None
 cur = None
+task = None
 
 
 def handler(signum, frame):
@@ -29,43 +30,36 @@ def errorOutTask(task):
     cur = conn.cursor()
     log("Erroring out task " + str(task))
     try:
-        cur.execute(f"update taskqueue set retry_ts = NOW() + 120 * interval '1 second' where id = {task['id']}")
+        cur.execute(f"update taskqueue set retry_ts = NOW() + 15 * interval '1 second' where id = {task['id']}")
         conn.commit()
     except Exception as e:
         print(e)
         if cur:
             cur.close()
     cur.close()
+  
+def test(TEMP_PATH, conn, task):
+    print("TESTTTTTTTTTTT")
+    time.sleep(10)
+      
+taskMap = {
+    'Add sync path': lambda: addSyncPathGetSubTask(task, TEMP_PATH, conn),
+    'Sync': lambda: syncFilesToRemote(conn, task, TEMP_PATH),
+    'Retrieve file from remote': lambda: downloadFileFromRemote(conn, task),
+    'Sync update': lambda: syncUpdateGetSubTask(task, TEMP_PATH, conn),
+    'Delete sync files': lambda: deleteSyncFiles(conn, task)
+    # 'Sync delete': lambda: triggerFileDelete(conn, task, TEMP_PATH)
+}
     
 # process the task
 # each task must handle marking itself complete
+####could use an options map here instead of globals and 
+####pass options as param to the lambda like 
+####taskMap[name](options) then lambda: options: (...)
 def processTask(task):
     try:
         name = task['name']
-        # determine task type
-        if name == 'Add sync path' and task['status'] != 'Cleaning up':
-            addSyncPathTask(task, TEMP_PATH, conn)
-        
-        elif (name == 'Add sync path' or name == 'Sync update') and task['status'] == 'Cleaning up':
-            cleanupNewSync(task, TEMP_PATH, conn)
-          
-        elif name == 'Sync':
-            syncFilesToRemote(conn, task, TEMP_PATH)
-            
-        elif name == 'Retrive file from remote':
-            downloadFileFromRemote(conn, task)
-            
-        elif name == 'Sync update' and task['status'] != 'Cleaning up':
-            syncUpdate(conn, task)
-            
-        # elif name == 'Determine pending deletes size':
-        #     determineSyncSizeForPendingDeletes(conn, task)    
-            
-        else:
-            # probably shouldn't be a real thing
-            log("Unsupported task type, erroring it out")
-            errorOutTask(task)
-            return
+        taskMap[name]()
         log("Finished task " + name)
     except Exception as e:
         log(traceback.format_exc())
@@ -74,17 +68,6 @@ def processTask(task):
 def readTaskQueue():
     cur = conn.cursor()
     try:
-        # cur.execute("""select * 
-        #             from taskqueue 
-        #             where try < 4 
-        #             and status <> 'Scheduled' 
-        #             and status <> 'Complete' 
-        #             and status <> 'Syncing'
-        #             and NOW() >= retry_ts
-        #             order by ts asc
-        #             limit 1""")
-        # task = cur.fetchone()
-        
         cur.execute("""select * 
                     from taskqueue 
                     where try < 4 
