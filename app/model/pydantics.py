@@ -35,3 +35,13 @@ class SyncUpdateData(BaseModel):
     name: str = Field(None, title="name")
     fileChanges: List[Dict[str, str]] = Field([], title="fileChanges")
     pendingDeletes: List[str]
+    
+class ServerInfo(BaseModel):
+    used_space_in_gb: float
+    nickname: str
+    address: str
+    token: str
+    port: int
+    remaining_space_in_gb: float
+    hosted_remaining_space_in_gb: float
+    hosted_used_space_in_gb: float

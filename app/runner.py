@@ -5,8 +5,9 @@ import json
 import signal
 from datetime import datetime
 from utility.task import *
-from scheduler import log
 import traceback
+from logs.customlogger import CustomLog
+from utility.psycopgUtil import getConn
 
 # # https://crontab.guru/#45_17_*_*_*
 
@@ -15,7 +16,7 @@ TEMP_PATH = None
 conn = None
 cur = None
 task = None
-
+log = CustomLog("Runner")
 
 def handler(signum, frame):
     msg = "Scheduler: Ctrl-c was pressed. "
@@ -28,12 +29,12 @@ def handler(signum, frame):
     
 def errorOutTask(task):
     cur = conn.cursor()
-    log("Erroring out task " + str(task))
+    log.error("Erroring out task " + str(task))
     try:
         cur.execute(f"update taskqueue set retry_ts = NOW() + 15 * interval '1 second' where id = {task['id']}")
         conn.commit()
     except Exception as e:
-        print(e)
+        log.error("", e)
         if cur:
             cur.close()
     cur.close()
@@ -60,9 +61,9 @@ def processTask(task):
     try:
         name = task['name']
         taskMap[name]()
-        log("Finished task " + name)
+        log.info("Finished task " + name)
     except Exception as e:
-        log(traceback.format_exc())
+        log.error(traceback.format_exc(), e)
         errorOutTask(task)
 
 def readTaskQueue():
@@ -90,7 +91,7 @@ def readTaskQueue():
             conn.commit()
             cur.close()
         elif len(tasks) > 0:
-            print(f"Next retry task will be at: {tasks[0]['retry_ts']}")
+            log.info(f"Next retry task will be at: {tasks[0]['retry_ts']}")
     except Exception as e:
         log(e)
         task = None
@@ -99,24 +100,25 @@ def readTaskQueue():
     return task
         
 if __name__ == "__main__":
-    conn = psycopg.connect(user = "postgres",
-                                password = "",
-                                host = "127.0.0.1",
-                                port = "5432",
-                                dbname = "nassync",
-                                row_factory=dict_row )
+    conn = getConn()
     cur = conn.cursor()
     
     # get needed properties
     cur.execute("select props from properties")
     props = cur.fetchone()['props']
     cur.close()
+    
+    props['startup_time'] = time.time()
+    with conn.cursor() as cur:
+        cur.execute(f"update properties set props = '{json.dumps(props)}'")
+        conn.commit()
+    
     TEMP_WITH_ORIGINAL = props['tempWithOriginal']
     if not TEMP_WITH_ORIGINAL:
         TEMP_PATH = props['tempPath']
-    log("Setting temp path " + TEMP_PATH)
+    log.info("Setting temp path " + TEMP_PATH)
     
-    log("Starting task loop")
+    log.info("Starting task loop")
     
     signal.signal(signal.SIGINT, handler) # catch sigint to close db conn first
     time.sleep(5)
@@ -127,11 +129,11 @@ if __name__ == "__main__":
             # print("TASK LOOP")
             task = readTaskQueue()
             if task:
-                log("Processing task: " + task['name'] + " task status: " + task['status'])
+                log.info("Processing task: " + task['name'] + " task status: " + task['status'])
                 processTask(task)
             else:
                 time.sleep(15) # move to else later
         except Exception as e:
-            print(e)
+            log.error("", e)
             time.sleep(15) # sleep 30s to check before checking for tasks again
 

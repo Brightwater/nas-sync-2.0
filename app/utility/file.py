@@ -12,8 +12,9 @@ from utility.database import database
 from fastapi.concurrency import run_in_threadpool
 import subprocess
 import json
-from model.pydantics import SyncUpdateData, Token, SyncData, DeleteSync
+from model.pydantics import SyncUpdateData, Token, SyncData
 from datetime import datetime, time, timedelta
+from logs.asynccustomlogger import Asynclog
 
 CHUNK_SIZE = 1024 * 1024 # 1MB
 
@@ -24,6 +25,8 @@ router = APIRouter(
     tags=["file"],
 )
 
+log = Asynclog("file")
+
 # openssl enc -aes-256-cbc -pbkdf2 -in sample.txt -out sample.txt.enc -pass pass:test123
 # openssl aes-256-cbc -d -pbkdf2 -in sample.txt.enc -out sample_decrypted.txt -pass pass:test123
 # openssl md5 {filepath}  
@@ -32,12 +35,14 @@ router = APIRouter(
 
 def openSslEncryptFile(token, inputFilePath, outPutFilePath):
     #cmd = f"openssl enc -aes-256-cbc -pbkdf2 -in {inputFilePath} -out {outPutFilePath} -pass pass:{token}".split(" ")
-    cmd = ["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-in", inputFilePath, "-out", outPutFilePath, "-pass", f"pass:{token.replace('$', '')}"]
+    cmd = ["openssl", "enc", "-aes-128-cbc", "-engine", "aesni", "-pbkdf2", "-in", inputFilePath, "-out", outPutFilePath, "-pass", f"pass:{token.replace('$', '')}"]
     return subprocess.run(cmd, capture_output=True, text=True).stderr
 
 def openSslDecryptFile(token, inputFilePath, outPutFilePath):
-    cmd = f"openssl aes-256-cbc -d -pbkdf2 -in {inputFilePath} -out {outPutFilePath} -pass pass:{token}".split(" ")
-    subprocess.run(cmd, capture_output=True, text=True)
+    cmd = ["openssl", "-aes-128-cbc", "-d", "-engine", "aesni", "-in", inputFilePath, "-out", outPutFilePath, "-pass", f"pass:{token.replace('$', '')}"]
+
+    # cmd = f"openssl aes-128-cbc -d -pbkdf2 -engine aesni -in {inputFilePath} -out {outPutFilePath} -pass pass:{token}".split(" ")
+    return subprocess.run(cmd, capture_output=True, text=True).stderr
     
 def getDirSize(inputFilePath):
     '''outputs in kilobytes'''
@@ -46,7 +51,7 @@ def getDirSize(inputFilePath):
     
 @router.get("/thetest")
 def computeMd5FileHash(inputFilePath):
-    return subprocess.check_output(args=['md5sum', inputFilePath]).decode().split(' ')[0].strip()
+    return subprocess.check_output(args=['md5sum',inputFilePath]).decode().split(' ')[0].strip()
 
 def getDirTreeDict(inputDirPath):
     tree = json.loads(subprocess.check_output(args=['tree', '-J', f'{inputDirPath}', '-L', '10']).decode())[0]
@@ -81,7 +86,7 @@ def addHashesToTree(tree, basePath, new: bool):
                 item['hash'] = computeMd5FileHash(basePath+"/"+item['name'])
                 item['type']= detFileType(item['name'])
     except Exception:
-        print(f"Exception building tree: {tree} probably too deep")
+        log.error(f"Exception building tree: {tree} probably too deep")
       
 async def getSyncFileFromFakeName(name, fakeName):
     remoteWithSyncs = await database.fetch_all(f"""select r.address, r.token, s.*
@@ -135,7 +140,8 @@ async def getSyncFileFromFakeName(name, fakeName):
             detail="file path not found",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    await run_in_threadpool(lambda: print("the path found: " + filePath))
+    
+    log("the path found: " + filePath)
   
     return filePath
         
@@ -558,12 +564,3 @@ async def hostFileDownloadForSync(name: str, token: str, fakeName: str, request:
 
     headers = {'Content-Disposition': f'attachment; filename="{fakeName}"'}
     return StreamingResponse(iterfile(), headers=headers, media_type='application/octet-stream')
-
-# @router.get("deleteSyncFileBlock")
-# async def deleteFileBlock(name: str, token: str, request: Request):
-#     if not await verifyRemote(name, token, request):
-#             raise HTTPException(
-#                 status_code=status.HTTP_401_UNAUTHORIZED,
-#                 detail="Incorrect username or password",
-#                 headers={"WWW-Authenticate": "Bearer"},
-#             )

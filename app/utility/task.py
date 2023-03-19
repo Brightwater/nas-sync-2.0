@@ -1,5 +1,4 @@
 from math import ceil
-from scheduler import log
 from utility.file import openSslEncryptFile, nameFile, nameFileSeeded, getDirTreeDict, addHashesToTree, getDirSize
 import json
 import pathlib
@@ -7,6 +6,9 @@ import os
 import requests
 import shutil
 import psycopg
+from logs.customlogger import CustomLog
+
+log = CustomLog("Tasks")
 
 def determineAddress(address, port):
     if port == None or port == "":
@@ -49,7 +51,7 @@ def encryptFullTree(tree, basePath, tempPlace, token, individualFilesWithHashes,
             # encrypt the file here...
             if tempPlace is None:
                 tempPlace = basePath
-            log('encrypting file Name: ' + item['name'] + " Fake name: " + item['nameFake'])
+            log.info('encrypting file Name: ' + item['name'] + " Fake name: " + item['nameFake'])
             err = openSslEncryptFile(token, basePath+"/"+item['name'], tempPlace+"/"+item['nameFake'])
             if err:
                 print("err got here")
@@ -92,7 +94,7 @@ def delFileInContentsRecursive(relPathSplit, contents: list, fakeName):
 def injectDelFileInContentsRecursive(relPathSplit, contents: list, fileObj):
     if len(relPathSplit) == 1:
         # final folder found
-        log("FOUND NEW FILE LOCATION")
+        log.info("FOUND NEW FILE LOCATION")
         contents.append(fileObj)
         return
     found = False
@@ -112,14 +114,14 @@ def placeDelFileInMetadata(filePath, rootPath: str, contents: list, fileObj):
     relPath = os.path.relpath(filePath, start=rootPath)
     relPathSplit = str(relPath).split("/")[:-1] # remove last element (the file itself) so we can find the folder
     relPathSplit.insert(0, os.path.basename(rootPath)) 
-    log("RELPATH " + str(relPathSplit))
+    log.info("RELPATH " + str(relPathSplit))
     injectDelFileInContentsRecursive(relPathSplit, contents, fileObj)
     
 def removeDelFileInMetadata(filePath, rootPath: str, contents: list, fakeName):
     relPath = os.path.relpath(filePath, start=rootPath)
     relPathSplit = str(relPath).split("/")[:-1] # remove last element (the file itself) so we can find the folder
     relPathSplit.insert(0, os.path.basename(rootPath)) 
-    log("RELPATH " + str(relPathSplit))
+    log.info("RELPATH " + str(relPathSplit))
     delFileInContentsRecursive(relPathSplit, contents, fakeName)
 
 def addSyncPathTask(conn, task, tempPlace):
@@ -136,7 +138,7 @@ def addSyncPathTask(conn, task, tempPlace):
     individualFilesWithPaths = []
     if task['task']['type'] == 'directory':
         #directory
-        log("Base path " + task['task']['name'])
+        log.info("Base path " + task['task']['name'])
         encryptFullTree(task['task'], task['task']['name'], tempPlace, token, individualFilesWithHashes, individualFilesWithPaths)
     else:
         raise Exception("Only dir allowed")
@@ -149,7 +151,7 @@ def addSyncPathTask(conn, task, tempPlace):
     
     dummyMetadataName = nameFile()
     inp = tempPlace+"/"+"metadata."+dummyMetadataName
-    log("creating metadata json file")
+    log.info("creating metadata json file")
     # create metadata file
     with open(inp+".json", "w") as metadata:
         # Writing data to a file
@@ -191,7 +193,7 @@ def syncFilesToRemote(conn: psycopg.connection, task, tempPlace):
     # first do the new syncs
     # if not old:
     
-    log("Starting sync task for remote " + task['task']['nickname'])
+    log.info("Starting sync task for remote " + task['task']['nickname'])
     # insert new task
     
     # get new sync dirs
@@ -213,7 +215,7 @@ def syncFilesToRemote(conn: psycopg.connection, task, tempPlace):
     newSyncs = cur.fetchall()
     cur.close()
     for sync in newSyncs:
-        log("Start sync for newsync " + sync['nickname'])
+        log.info("Start sync for newsync " + sync['nickname'])
         
         #build object to send the remote
         sendObj = {}
@@ -232,14 +234,14 @@ def syncFilesToRemote(conn: psycopg.connection, task, tempPlace):
                 # remote is not up currently... delay task until its up
                 with conn.cursor() as cur:
                     minutesUntil = int(json.loads(req.text)['detail'])
-                    log(f"sleeping task until remote is ready in {minutesUntil} minutes" + str(task))
+                    log.info(f"sleeping task until remote is ready in {minutesUntil} minutes" + str(task))
                     cur.execute(f"update taskqueue set retry_ts = NOW() + {minutesUntil} * interval '1 minute' where id = {task['id']}")
                     conn.commit()
                 return
             elif req.status_code != 200:
                 raise Exception
         except:
-            log(f"Remote {sync['nickname']} not up or not accepting syncs currently. Will try again later.")
+            log.warn(f"Remote {sync['nickname']} not up or not accepting syncs currently. Will try again later.")
             continue
         # update the syncs task
         cur = conn.cursor()
@@ -257,7 +259,7 @@ def syncFilesToRemote(conn: psycopg.connection, task, tempPlace):
     cur.close()
     
     for sync in existingSyncs:
-        log("Start sync for existing sync " + sync['name'])
+        log.info("Start sync for existing sync " + sync['name'])
 
         metadata = sync['metadata']
         # first recalculate the sync
@@ -270,7 +272,7 @@ def syncFilesToRemote(conn: psycopg.connection, task, tempPlace):
         individualFilesWithPaths = []
         if metadata['type'] == 'directory':
             #directory
-            log("Base path " + metadata['name'])
+            log.info("Base path " + metadata['name'])
             fullTreeGetFiles(tree, tree['name'], individualFilesWithHashes, individualFilesWithPaths)
         else:
             raise Exception("Only dir supported")
@@ -292,7 +294,7 @@ def syncFilesToRemote(conn: psycopg.connection, task, tempPlace):
                     if file['hash'] != origFile['hash']:
                         # file was changed
                         file['status'] = "Update"
-                        log(f"File {individualFilesWithPaths[outCount]} was changed. Will trigger a re sync")
+                        log.info(f"File {individualFilesWithPaths[outCount]} was changed. Will trigger a re sync")
                         individualFilesWithHashesChanges.append(file)
                         
                         # encrypt the file
@@ -303,7 +305,7 @@ def syncFilesToRemote(conn: psycopg.connection, task, tempPlace):
                 inCount = inCount + 1
             if not origFileExists:
                 # this file is new
-                log(f"File {individualFilesWithPaths[outCount]} is new. Will trigger it to sync")
+                log.info(f"File {individualFilesWithPaths[outCount]} is new. Will trigger it to sync")
                 # add the other metadata
                 file['status'] = "New"
                 individualFilesWithHashesChanges.append(file)
@@ -326,16 +328,15 @@ def syncFilesToRemote(conn: psycopg.connection, task, tempPlace):
                     break
             if not fileStillExists:
                 # file was deleted but in case something went wrong will notify the user before remote deletion happens
-                log(f"File {origFile['fullPath']} was deleted locally. Will log the file to be deleted on remote after confirmation")
+                log.info(f"File {origFile['fullPath']} was deleted locally. Will log the file to be deleted on remote after confirmation")
                 filesToMarkDelete.append(origFile)
                     
         confirmedDelList = []
-        print("GOT")
         with conn.cursor() as cur:
             cur.execute(f"select * from pending_file_deletes where sync = '{metadata['syncFakeName']}'")
             pd = cur.fetchone()
-            print("HERE")
-            print(pd)
+            # print("HERE")
+            # print(pd)
             if pd:
                 if pd['confirmed'] == 'Y':
                     print(pd['metadata'])
@@ -358,7 +359,7 @@ def syncFilesToRemote(conn: psycopg.connection, task, tempPlace):
             remote = cur.fetchall()
             cur.close()
             remainingSize = remote[0]['remaining_space_in_kb']
-            log("Space remaining on remote " + str(remainingSize) + " KB")
+            log.info("Space remaining on remote " + str(remainingSize) + " KB")
             amountRemaining = int(remainingSize) - 100 # 10mb buffer
             
             if amountRemaining <= newSize:
@@ -387,7 +388,7 @@ def syncFilesToRemote(conn: psycopg.connection, task, tempPlace):
             
             if len(filesToMarkDelete) > 0:
                 # handle the new deleted 
-                log("insert pending deleted " + str(filesToMarkDelete))
+                log.info("insert pending deleted " + str(filesToMarkDelete))
                 try: # delete old deletes for this sync
                     with conn.cursor() as cur:
                         cur.execute(f"delete from pending_file_deletes where sync = '{metadata['syncFakeName']}'")
@@ -411,7 +412,7 @@ def syncFilesToRemote(conn: psycopg.connection, task, tempPlace):
             if len(individualFilesWithHashesChanges) > 0 or len(confirmedDelList) > 0:
                 dummyMetadataName = metadata['syncFakeName']
                 inp = tempPlace+"/"+"metadata."+dummyMetadataName
-                log("creating metadata json file for sync update")
+                log.info("creating metadata json file for sync update")
                 # create metadata file
                 with open(inp+".json", "w") as metadataFile:
                     data = json.dumps(metadata)
@@ -422,19 +423,24 @@ def syncFilesToRemote(conn: psycopg.connection, task, tempPlace):
                     raise(Exception(err))
                 os.remove(inp+".json")
                 
+                # with conn.cursor() as cur:
+                #     log("delete confirmed sync " + str(metadata['name']))
+                #     cur.execute(f"insert into taskqueue (name, task, ts, status, try, retry_ts) values('Sync update', '{json.dumps(metadata)}', NOW(), 'Queued', 0, NOW())")
+
+                
                 with conn.cursor() as cur:
-                    log("insert sync updates task " + str(metadata['name']))
+                    log.info("insert sync updates task " + str(metadata['name']))
                     cur.execute(f"insert into taskqueue (name, task, ts, status, try, retry_ts) values('Sync update', '{json.dumps(metadata)}', NOW(), 'Queued', 0, NOW())")
                 
             conn.commit()
         else:
-            log(f"No changed files for sync {sync}")
+            log.info(f"No changed files for sync {sync}")
 
     # complete task
     updateTaskStatus(conn, 'Complete', task)
     
 def syncUpdate(conn, task):
-    log("In sync update")
+    log.info("In sync update")
     
     with conn.cursor() as cur:
         cur.execute(f"select * from my_remotes where nickname = '{task['task']['remote']}'")
@@ -463,21 +469,21 @@ def syncUpdate(conn, task):
             # remote is not up currently... delay task until its up
             with conn.cursor() as cur:
                 minutesUntil = int(json.loads(req.text)['detail'])
-                log(f"sleeping task until remote is ready in {minutesUntil} minutes" + str(task))
+                log.info(f"sleeping task until remote is ready in {minutesUntil} minutes" + str(task))
                 cur.execute(f"update taskqueue set retry_ts = NOW() + {minutesUntil} * interval '1 minute' where id = {task['id']}")
                 conn.commit()
             return
         if req.status_code != 200:
             raise Exception
     except:
-        log(f"Remote {metadata['remote']} not up or not accepting syncs currently. Will try again later.")
+        log.warn(f"Remote {metadata['remote']} not up or not accepting syncs currently. Will try again later.")
         raise Exception
     
     updateTaskStatus(conn, 'Syncing', task)
     
     
 def downloadFileFromRemote(conn, task):
-    log(f"Starting file download for fake name {task['task']['nameFake']}")
+    log.info(f"Starting file download for fake name {task['task']['nameFake']}")
     
     # get remaining hosted remote space
     cur = conn.cursor()
@@ -496,7 +502,7 @@ def downloadFileFromRemote(conn, task):
     # name: str, token: str, fakeName
     req = requests.get(f"{addr}/file/getFileSize", params=params)
     if req.status_code != 200:
-        log(f"Remote {task['task']['remote']} not up or not accepting syncs currently. Will try again later. The actual error code was: {req.status_code}")
+        log.warn(f"Remote {task['task']['remote']} not up or not accepting syncs currently. Will try again later. The actual error code was: {req.status_code}")
         raise Exception
     
     sizeNeeded = int(ceil(float(req.text)))
@@ -534,7 +540,7 @@ def downloadFileFromRemote(conn, task):
                     f.write(chunk)
         else:
             # If the HTTP status code is not 200, raise an error
-            log(f"Remote {task['task']['remote']} not up or not accepting syncs currently. Will try again later.")
+            log.warn(f"Remote {task['task']['remote']} not up or not accepting syncs currently. Will try again later.")
             raise ValueError(f"HTTP status code {r.status_code}")
     except Exception as e:
         # If there was an error making the request, raise an error
@@ -544,7 +550,7 @@ def downloadFileFromRemote(conn, task):
     # and raise error
     actualSize = os.path.getsize(f"{task['task']['filePath']}/{task['task']['nameFake']}") * 0.001
     if actualSize > sizeNeeded:
-        log(f"File size not as reported by remote server. Deleting the file. ACTUAL SIZE: {actualSize}, STATED SIZE: {sizeNeeded}")
+        log.warn(f"File size not as reported by remote server. Deleting the file. ACTUAL SIZE: {actualSize}, STATED SIZE: {sizeNeeded}")
         if os.path.exists(f"{task['task']['filePath']}/{task['task']['nameFake']}"):
             os.remove(f"{task['task']['filePath']}/{task['task']['nameFake']}")
         raise Exception("Incorrectly sized file from remote")
@@ -567,7 +573,7 @@ def downloadFileFromRemote(conn, task):
     conn.commit()
     
     if task['task']['index'] == task['task']['numInSync']:
-        log("last file in sync reached")
+        log.info("last file in sync reached")
         # mark the sync as synced
         
         with conn.cursor() as cur:
@@ -587,7 +593,7 @@ def downloadFileFromRemote(conn, task):
                     'syncName': task['task']['syncName'], 'isUpdate': isUpdate, 'usedSpace': usedSpace}
         req = requests.get(f"{addr}/file/notifySyncComplete", params=params)
         if req.status_code != 200:
-            log(f"Remote {task['task']['remote']} not up or not accepting syncs currently. Will try again later. The actual error code was: {req.status_code}")
+            log.warn(f"Remote {task['task']['remote']} not up or not accepting syncs currently. Will try again later. The actual error code was: {req.status_code}")
             raise Exception
     
     updateTaskStatus(conn, 'Complete', task)
@@ -600,16 +606,15 @@ def deleteSyncFiles(conn: psycopg.connection, task):
         cur.execute(f"""select * from hosted_syncs where name = '{metadata['syncName']}'""")
         files = cur.fetchone()
         files = files['files']
-        print(files)
+        log.info(files)
     
     for delFile in metadata['pendingDeletes']:
-        # get file size on disk.
-        actualSize = os.path.getsize(f"{metadata['filePath']}/{delFile}") * 0.001
-        
+        actualSize = 0
         # delete file from disk
         if os.path.exists(f"{metadata['filePath']}/{delFile}"):
+            actualSize = os.path.getsize(f"{metadata['filePath']}/{delFile}") * 0.001
             os.remove(f"{metadata['filePath']}/{delFile}")
-            log("Removing the file as remote requested. File fake name: " + delFile)
+            log.info("Removing the file as remote requested. File fake name: " + delFile)
             
         # remove file from files list
         for file in files:
@@ -658,24 +663,24 @@ def cleanupNewSync(conn, task, tempPlace):
         for file in task['task']['individualFilesWithPaths']:
             fakeName = file['nameFake']
             if os.path.exists(f"{tempPlace}/{fakeName}"):
-                log(f"Removing temporary file: {tempPlace}/{fakeName}")
+                log.info(f"Removing temporary file: {tempPlace}/{fakeName}")
                 os.remove(f"{tempPlace}/{fakeName}")
             else:
-                log(f"Temp file not found {tempPlace}/{fakeName}")
+                log.warn(f"Temp file not found {tempPlace}/{fakeName}")
     else:
         for file in task['task']['fileChanges']:
             fakeName = file['nameFake']
             if os.path.exists(f"{tempPlace}/{fakeName}"):
-                log(f"Removing temporary file: {tempPlace}/{fakeName}")
+                log.info(f"Removing temporary file: {tempPlace}/{fakeName}")
                 os.remove(f"{tempPlace}/{fakeName}")
             else:
-                log(f"Temp file not found {tempPlace}/{fakeName}")
+                log.warn(f"Temp file not found {tempPlace}/{fakeName}")
     # clean metadata file
     if os.path.exists(f"{task['task']['metadataFilePath']}"):
-        log(f"Removing temporary file: {task['task']['metadataFilePath']}")
+        log.info(f"Removing temporary file: {task['task']['metadataFilePath']}")
         os.remove(f"{task['task']['metadataFilePath']}")
                 
-    log("Cleaned up files in sync {task}.")
+    log.info("Cleaned up files in sync {task}.")
             
     updateTaskStatus(conn, 'Complete', task)
     
